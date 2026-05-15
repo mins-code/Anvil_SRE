@@ -198,7 +198,7 @@ class Memory:
     def get_all_past_incidents(self, exclude_id: str):
         import json
         query = """
-            SELECT incident_id, canonical_id, trigger, fingerprint_json
+            SELECT incident_id, canonical_id, trigger, fingerprint_json, causal_json
             FROM incidents
             WHERE incident_id != ? AND fingerprint_json IS NOT NULL
         """
@@ -206,16 +206,26 @@ class Memory:
         
         past_incidents = []
         for row in results:
-            inc_id, can_id, trig, fp_json = row
+            inc_id, can_id, trig, fp_json, causal_json_str = row
             try:
                 fp_dict = json.loads(fp_json) if fp_json else {}
+                causal_chain = json.loads(causal_json_str) if causal_json_str else []
                 past_incidents.append({
                     "incident_id": inc_id,
                     "canonical_id": can_id,
                     "trigger": trig,
-                    "fingerprint": fp_dict
+                    "fingerprint": fp_dict,
+                    "causal_chain": causal_chain
                 })
             except json.JSONDecodeError:
                 pass
                 
         return past_incidents
+
+    def get_remediations_for_incident(self, incident_id: str):
+        query = """
+            SELECT action, target_id, version, outcome
+            FROM remediations
+            WHERE incident_id = ?
+        """
+        return self.db.execute(query, (incident_id,)).fetchall()
