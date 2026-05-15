@@ -5,12 +5,69 @@ from engine.fingerprint import extract_fingerprint, combined_similarity as fp_si
 from engine.motif import extract_motif, get_motif_name
 
 def temporal_confidence(ts1, ts2, base=1.0):
-    return base
+    """
+    Returns confidence decayed exponentially with the time gap between ts1 and ts2.
 
-def combined_similarity(fp_curr, fp_past, motif_curr, motif_past):
-    fp_score = fp_sim(fp_curr, fp_past)
-    motif_score = 1.0 if motif_curr == motif_past else 0.0
-    return (fp_score + motif_score) / 2.0
+    Formula: base * exp(-gap_s / 300)
+      - gap =   0 s  → confidence = base        (1.00× at t=0)
+      - gap = 300 s  → confidence ≈ base * 0.37  (5-minute half-life)
+      - gap = 600 s  → confidence ≈ base * 0.135 (10 min)
+      - gap = 900 s  → confidence ≈ base * 0.050 (15 min)
+
+    Falls back to base if either timestamp is missing or unparseable.
+    """
+    import math
+    if not ts1 or not ts2:
+        return base
+    try:
+        t1 = datetime.fromisoformat(ts1.replace("Z", "+00:00"))
+        t2 = datetime.fromisoformat(ts2.replace("Z", "+00:00"))
+        gap_s = abs((t2 - t1).total_seconds())
+        return round(base * math.exp(-gap_s / 300.0), 4)
+    except (ValueError, AttributeError):
+        return base
+
+def _identity_overlap_score(canon_curr, canon_past, tig):
+    """
+    Returns 0.0–1.0 based on whether the two canonical IDs share lineage in the TIG.
+    - Exact same canonical ID → 1.0
+    - One is an ancestor of the other (rename/split/merge) → 0.6
+    - No overlap → 0.0
+    """
+    if not canon_curr or not canon_past:
+        return 0.0
+    if canon_curr == canon_past:
+        return 1.0
+    if tig is not None:
+        ancestors_curr = tig.ancestors(canon_curr)
+        ancestors_past = tig.ancestors(canon_past)
+        if ancestors_curr & ancestors_past:  # non-empty intersection
+            return 0.6
+    return 0.0
+
+def combined_similarity(fp_curr, fp_past, motif_curr, motif_past,
+                        canon_curr=None, canon_past=None, tig=None):
+    """
+    Weighted similarity combining fingerprint signals, structural motif,
+    and canonical service identity via the TIG.
+
+    Weight budget:
+      - Fingerprint (behavioral signals): 0.55
+      - Structural motif:                 0.15
+      - Identity overlap (TIG):           0.30
+    """
+    fp_score     = fp_sim(fp_curr, fp_past)                                         # 0.0–1.0
+    motif_score  = 1.0 if motif_curr == motif_past else 0.0                         # 0.0 or 1.0
+    id_score     = _identity_overlap_score(canon_curr, canon_past, tig)             # 0.0, 0.6, or 1.0
+
+    raw = (fp_score * 0.55) + (motif_score * 0.15) + (id_score * 0.30)
+
+    # Penalise cross-service noise: if identity is unknown and scores differ,
+    # apply a light penalty so unrelated services don't float past the threshold.
+    if id_score == 0.0 and canon_curr and canon_past:
+        raw -= 0.10
+
+    return max(0.0, min(1.0, round(raw, 3)))
 
 def extract_service_name_from_trigger(trigger):
     parts = trigger.split(':', 1)
@@ -70,8 +127,15 @@ def reconstruct(memory, signal, mode="fast") -> dict:
     errors  = [e for e in related_events
                if e.get("kind") == "log" and e.get("level") == "error"]
 
+    def _eid(e: dict) -> str:
+        """Compute the same MD5 event ID that store_event uses."""
+        return hashlib.md5(json.dumps(e, sort_keys=True).encode()).hexdigest()
+
+    signal_eid = _eid(signal)
+
     causal_chain = []
     for deploy in deploys:
+        deploy_eid = _eid(deploy)
         for spike in spikes:
             if deploy.get("ts", "") < spike.get("ts", ""):
                 try:
@@ -82,8 +146,8 @@ def reconstruct(memory, signal, mode="fast") -> dict:
                     gap_s = 0
                 conf = temporal_confidence(deploy.get("ts"), spike.get("ts"), base=0.85)
                 causal_chain.append({
-                    "cause_event_id":  f"deploy:{deploy.get('version','unknown')}",
-                    "effect_event_id": f"spike:{spike.get('name','metric')}",
+                    "cause_event_id":  deploy_eid,
+                    "effect_event_id": _eid(spike),
                     "evidence":  f"Deploy {deploy.get('version', 'unknown')} preceded spike by {gap_s:.0f}s",
                     "confidence": conf
                 })
@@ -91,8 +155,8 @@ def reconstruct(memory, signal, mode="fast") -> dict:
             if deploy.get("ts", "") < error.get("ts", ""):
                 conf = temporal_confidence(deploy.get("ts"), error.get("ts"), base=0.75)
                 causal_chain.append({
-                    "cause_event_id":  f"deploy:{deploy.get('version','unknown')}",
-                    "effect_event_id": f"error:{error.get('msg','')[:40]}",
+                    "cause_event_id":  deploy_eid,
+                    "effect_event_id": _eid(error),
                     "evidence":  f"Deploy {deploy.get('version', 'unknown')} preceded error",
                     "confidence": conf
                 })
@@ -100,8 +164,8 @@ def reconstruct(memory, signal, mode="fast") -> dict:
         if spike.get("ts", "") <= signal.get("ts", ""):
             conf = temporal_confidence(spike.get("ts"), signal.get("ts"), base=0.90)
             causal_chain.append({
-                "cause_event_id":  f"spike:{spike.get('name','metric')}",
-                "effect_event_id": f"incident:{incident_id}",
+                "cause_event_id":  _eid(spike),
+                "effect_event_id": signal_eid,
                 "evidence":  "Metric spike preceded incident declaration",
                 "confidence": conf
             })
@@ -114,20 +178,29 @@ def reconstruct(memory, signal, mode="fast") -> dict:
 
     # Step 5: similar past incidents (key: "incident_id")
     past_incidents = memory.get_all_past_incidents(exclude_id=incident_id) if hasattr(memory, 'get_all_past_incidents') else []
+    tig = memory.tig if hasattr(memory, 'tig') else None
     scored = []
     for past in past_incidents:
-        fp_past    = past.get("fingerprint", {})
-        motif_past = extract_motif(past.get("causal_chain", []))
-        sim = combined_similarity(fp_current, fp_past, motif_current, motif_past)
+        fp_past     = past.get("fingerprint", {})
+        motif_past  = extract_motif(past.get("causal_chain", []))
+        canon_past  = past.get("canonical_id")
+        sim = combined_similarity(
+            fp_current, fp_past,
+            motif_current, motif_past,
+            canon_curr=canonical_id, canon_past=canon_past,
+            tig=tig,
+        )
         if sim >= 0.35:
+            id_match = canon_past == canonical_id if (canonical_id and canon_past) else None
             scored.append({
                 "incident_id": past.get("incident_id", "unknown"),
                 "similarity":  sim,
                 "rationale": (
-                    f"Matched via fingerprint+motif ({get_motif_name(motif_current)}). "
+                    f"Matched via fingerprint+motif+identity ({get_motif_name(motif_current)}). "
                     f"trigger_type={'match' if fp_current.get('trigger_type')==fp_past.get('trigger_type') else 'diff'}, "
                     f"had_deploy={fp_current.get('had_deploy')}/{fp_past.get('had_deploy')}, "
-                    f"had_spike={fp_current.get('had_spike')}/{fp_past.get('had_spike')}"
+                    f"had_spike={fp_current.get('had_spike')}/{fp_past.get('had_spike')}, "
+                    f"identity={'same' if id_match else 'related' if id_match is False else 'unknown'}"
                 )
             })
     scored.sort(key=lambda x: x.get("similarity", 0), reverse=True)

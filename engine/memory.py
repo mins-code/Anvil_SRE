@@ -135,6 +135,17 @@ class Memory:
                 version = event.get('version')
                 outcome = event.get('outcome')
                 
+                if target_id is None:
+                    import warnings
+                    warnings.warn(
+                        f"Skipping remediation record for incident '{incident_id}': "
+                        f"could not resolve a canonical_id for target service "
+                        f"(raw target={event.get('target')!r}). "
+                        "Check that the remediation event includes a valid 'target' field.",
+                        stacklevel=2,
+                    )
+                    return
+                
                 self.db.execute('''
                     INSERT INTO remediations
                     (incident_id, action, target_id, version, outcome, happened_at)
@@ -238,6 +249,27 @@ class Memory:
             for event in events:
                 self.store_event(event)
             self.db.execute("COMMIT")
+            
+            import json
+            from engine.fingerprint import extract_fingerprint
+            for event in events:
+                if event.get('kind') == 'incident_signal':
+                    incident_id = event.get('incident_id')
+                    happened_at = event.get('ts') or event.get('happened_at')
+                    trigger = event.get('trigger', '')
+                    
+                    row = self.db.execute("SELECT canonical_id FROM incidents WHERE incident_id = ?", (incident_id,)).fetchone()
+                    if row:
+                        canonical_id = row[0]
+                        events_in_window = self.get_events_in_window(canonical_id, happened_at, window_minutes=20)
+                        fingerprint = extract_fingerprint(events_in_window, trigger, happened_at)
+                        fingerprint_json = json.dumps(fingerprint)
+                        
+                        self.db.execute('''
+                            UPDATE incidents
+                            SET fingerprint_json = ?
+                            WHERE incident_id = ?
+                        ''', (fingerprint_json, incident_id))
         except Exception:
             self.db.execute("ROLLBACK")
             raise
