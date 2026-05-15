@@ -7,14 +7,14 @@ class MockTIG:
         self.splits = []
         self.merges = []
 
-    def rename(self, from_val, to_val):
-        self.renames.append((from_val, to_val))
+    def rename(self, from_val, to_val, ts):
+        self.renames.append((from_val, to_val, ts))
 
-    def split(self, from_val, to_val):
-        self.splits.append((from_val, to_val))
+    def split(self, from_val, into_val, ts):
+        self.splits.append((from_val, into_val, ts))
         
-    def merge(self, from_val, to_val):
-        self.merges.append((from_val, to_val))
+    def merge(self, from_val, to_val, ts):
+        self.merges.append((from_val, to_val, ts))
 
 @pytest.fixture
 def memory():
@@ -79,11 +79,31 @@ def test_ingest_rename_topology(memory):
 
     # Verify that TIG was called with the correct parameters
     assert len(memory.tig.renames) == 1
-    assert memory.tig.renames[0] == ("old-service", "new-service")
+    assert memory.tig.renames[0] == ("old-service", "new-service", None)
 
     # Verify no row was inserted into the events table for topology
     result = memory.db.execute("SELECT * FROM events").fetchall()
     assert len(result) == 0, "Topology event should not be stored in events table"
+
+def test_ingest_merge_topology(memory):
+    """
+    Test Case: Ingest a 'merge' topology event where from_ is a list of strings.
+    """
+    ts = "2026-05-10T15:00:00Z"
+    event = {
+        "kind": "topology",
+        "change": "merge",
+        "from_": ["service-a", "service-b"],
+        "to": "merged-service",
+        "ts": ts
+    }
+
+    memory.store_event(event)
+
+    # Verify that TIG was called with the correct parameters
+    assert len(memory.tig.merges) == 1
+    assert memory.tig.merges[0] == (["service-a", "service-b"], "merged-service", ts)
+
 
 def test_missing_fields_graceful_handling(memory):
     """

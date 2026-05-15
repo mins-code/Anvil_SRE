@@ -70,3 +70,43 @@ def extract_fingerprint(events, trigger, end_ts):
         "deploy_gap_s": deploy_gap_s,
         "event_kinds": list(event_kinds)
     }
+
+def combined_similarity(fp1, fp2):
+    """
+    Returns a float 0.0-1.0 indicating similarity between two fingerprints.
+    """
+    score = 0.0
+    
+    # Trigger type and metric match (High Weight)
+    if fp1.get("trigger_type") == fp2.get("trigger_type"):
+        score += 0.30
+        if fp1.get("trigger_metric") and fp1.get("trigger_metric") == fp2.get("trigger_metric"):
+            score += 0.10  # Bonus for exact metric match
+    else:
+        # Significant penalty for completely different trigger types
+        score -= 0.20
+
+    # Both had deploys
+    if fp1.get("had_deploy") == fp2.get("had_deploy"):
+        score += 0.25
+
+    # Both had spikes
+    if fp1.get("had_spike") == fp2.get("had_spike"):
+        score += 0.20
+
+    # Both had errors
+    if fp1.get("had_errors") == fp2.get("had_errors"):
+        score += 0.15
+
+    # Similar deploy gap
+    gap1 = fp1.get("deploy_gap_s", 0)
+    gap2 = fp2.get("deploy_gap_s", 0)
+    if gap1 > 0 and gap2 > 0:
+        ratio = min(gap1, gap2) / max(gap1, gap2)
+        score += 0.10 * ratio
+    elif gap1 == 0 and gap2 == 0:
+        score += 0.10  # Both zero gap
+
+    # Ensure bounds between 0.0 and 1.0
+    return max(0.0, min(1.0, round(score, 3)))
+
