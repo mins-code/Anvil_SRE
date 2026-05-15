@@ -1,1 +1,72 @@
-# Placeholder for Layer 2b: Behavioral pattern extraction
+from datetime import datetime
+import re
+
+def extract_fingerprint(events, trigger, end_ts):
+    """
+    Extracts a behavioral fingerprint from a window of telemetry events.
+    """
+    # Parse trigger string, e.g., 'alert:service-name/latency_p99_ms>3000'
+    parts = trigger.split(':', 1)
+    trigger_type = parts[0] if len(parts) > 0 else "unknown"
+    
+    trigger_metric = ""
+    if len(parts) > 1:
+        rest = parts[1]
+        if '/' in rest:
+            metric_part = rest.split('/', 1)[1]
+            trigger_metric = re.split(r'[><=]', metric_part)[0]
+
+    had_deploy = False
+    had_spike = False
+    had_errors = False
+    last_deploy_ts_str = None
+    event_kinds = set()
+
+    for e in events:
+        kind = e.get("kind")
+        if not kind:
+            continue
+            
+        event_kinds.add(kind)
+        
+        if kind == "deploy":
+            had_deploy = True
+            ts_str = e.get("ts") or e.get("happened_at")
+            if ts_str:
+                if not last_deploy_ts_str or ts_str > last_deploy_ts_str:
+                    last_deploy_ts_str = ts_str
+                    
+        elif kind == "metric":
+            if e.get("value", 0) > 1000 and "latency" in e.get("name", ""):
+                had_spike = True
+                
+        elif kind == "log":
+            if e.get("level") == "error":
+                had_errors = True
+
+    deploy_gap_s = 0.0
+    if had_deploy and last_deploy_ts_str and end_ts:
+        try:
+            # Handle ISO formats correctly, replacing Z with +00:00 for python < 3.11 compatibility
+            fmt_deploy = last_deploy_ts_str.replace("Z", "+00:00")
+            fmt_end = end_ts.replace("Z", "+00:00")
+            
+            t_deploy = datetime.fromisoformat(fmt_deploy)
+            t_end = datetime.fromisoformat(fmt_end)
+            deploy_gap_s = (t_end - t_deploy).total_seconds()
+            
+            # Ensure deploy gap is non-negative
+            if deploy_gap_s < 0:
+                deploy_gap_s = 0.0
+        except ValueError:
+            pass
+
+    return {
+        "trigger_type": trigger_type,
+        "trigger_metric": trigger_metric,
+        "had_deploy": had_deploy,
+        "had_spike": had_spike,
+        "had_errors": had_errors,
+        "deploy_gap_s": deploy_gap_s,
+        "event_kinds": list(event_kinds)
+    }
