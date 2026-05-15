@@ -112,23 +112,14 @@ class TemporalIdentityGraph:
         return visited
 
     def current_name(self, canonical_id: str) -> str:
-        """Find the current active name for a canonical ID by following forward edges."""
-        current_id = canonical_id
-        visited = set()
-        
-        while current_id not in visited:
-            visited.add(current_id)
-            node = self.nodes.get(current_id)
-            if not node:
-                return "unknown"
-            
-            if node.active_until is None:
-                return node.name
-                
-            forward_edges = self._forward_edges.get(current_id, [])
-            if not forward_edges:
-                return node.name
-                
-            current_id = forward_edges[-1].to_id
-            
-        return "unknown"
+        """Find the current active name for a canonical ID by finding the newest matching node."""
+        newest_name = None
+        newest_ts = ""
+
+        for node in self.nodes.values():
+            if node.canonical_id == canonical_id:
+                if not newest_ts or node.active_from > newest_ts:
+                    newest_ts = node.active_from
+                    newest_name = node.name
+
+        return newest_name if newest_name else canonical_id

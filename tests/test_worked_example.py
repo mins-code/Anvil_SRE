@@ -47,7 +47,7 @@ def run_worked_example():
     assert "suggested_remediations" in context, "Missing 'suggested_remediations' key!"
     assert "explain" in context, "Missing 'explain' key!"
 
-    print("✅ SUCCESS! The engine output matches the required Context shape.")
+    print("SUCCESS! The engine output matches the required Context shape.")
     
     # Clean up the database
     engine.close()
