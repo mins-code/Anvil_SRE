@@ -48,7 +48,7 @@ def extract_motif(causal_chain: List[Dict[str, Any]]) -> tuple:
     empty chain → ()
     """
     if not causal_chain:
-        return ()
+        return None
 
     nodes_in_order: List[str] = []
     seen: set = set()
@@ -64,7 +64,7 @@ def extract_motif(causal_chain: List[Dict[str, Any]]) -> tuple:
             seen.add(effect_kind)
 
     if not nodes_in_order:
-        return ()
+        return None
 
     result = []
     last = len(nodes_in_order) - 1

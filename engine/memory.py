@@ -101,7 +101,16 @@ class Memory:
             
             # Resolve to canonical_id
             canonical_id = service_name
-            if hasattr(self, 'tig') and self.tig is not None and service_name:
+            
+            is_high_value = False
+            if kind in ('deploy', 'incident_signal', 'remediation', 'trace'):
+                is_high_value = True
+            elif kind == 'log' and event.get('level') == 'error':
+                is_high_value = True
+            elif kind == 'metric' and event.get('value', 0) > 1000 and 'latency' in event.get('name', '').lower():
+                is_high_value = True
+
+            if is_high_value and hasattr(self, 'tig') and self.tig is not None and service_name:
                 # Use TIG lookup if available
                 if hasattr(self.tig, 'lookup'):
                     canonical_id = self.tig.lookup(service_name, at_time=happened_at)
@@ -152,7 +161,7 @@ class Memory:
                     VALUES (?, ?, ?, ?, ?, ?)
                 ''', (incident_id, action, target_id, version, outcome, happened_at))
 
-    def get_events_in_window(self, canonical_id: str, ts: str, window_minutes: int = 20):
+    def get_events_in_window(self, canonical_ids: list, ts: str, window_minutes: int = 60):
         import json
         from datetime import datetime, timedelta
 
@@ -169,16 +178,10 @@ class Memory:
         start_str  = start_time.isoformat()
         end_str    = target_time.isoformat()
 
-        target_ids = {canonical_id}
-        if hasattr(self, 'tig') and self.tig is not None:
-            ancestors = self.tig.ancestors(canonical_id)
-            if ancestors:
-                target_ids.update(ancestors)
-
-        id_list = list(target_ids)
-        if not id_list:
+        if not canonical_ids:
             return []
 
+        id_list = list(set(canonical_ids))
         placeholders = ','.join(['?'] * len(id_list))
         params = [start_str, end_str] + id_list
 
@@ -296,9 +299,15 @@ class Memory:
                     continue
 
                 canonical_id = row[0]
+                target_ids = {canonical_id}
+                if hasattr(self, 'tig') and self.tig is not None:
+                    ancestors = self.tig.ancestors(canonical_id)
+                    if ancestors:
+                        target_ids.update(ancestors)
+
                 try:
                     events_in_window = self.get_events_in_window(
-                        canonical_id, happened_at, window_minutes=20)
+                        list(target_ids), happened_at, window_minutes=60)
                     fingerprint      = extract_fingerprint(events_in_window, trigger, happened_at)
                     fingerprint_json = json.dumps(fingerprint)
                     self.db.execute(

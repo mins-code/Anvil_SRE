@@ -18,7 +18,8 @@ def extract_fingerprint(events, trigger, end_ts):
 
     had_deploy = False
     had_spike = False
-    had_errors = False
+    error_count = 0
+    has_traces = False
     last_deploy_ts_str = None
     event_kinds = set()
 
@@ -42,9 +43,13 @@ def extract_fingerprint(events, trigger, end_ts):
                 
         elif kind == "log":
             if e.get("level") == "error":
-                had_errors = True
+                error_count += 1
+                
+        elif kind == "trace":
+            has_traces = True
 
     deploy_gap_s = 0.0
+    gap_bucket = "none"
     if had_deploy and last_deploy_ts_str and end_ts:
         try:
             # Handle ISO formats correctly, replacing Z with +00:00 for python < 3.11 compatibility
@@ -58,6 +63,13 @@ def extract_fingerprint(events, trigger, end_ts):
             # Ensure deploy gap is non-negative
             if deploy_gap_s < 0:
                 deploy_gap_s = 0.0
+                
+            if deploy_gap_s < 60:
+                gap_bucket = "instant"
+            elif deploy_gap_s <= 300:
+                gap_bucket = "rapid"
+            elif deploy_gap_s <= 1800:
+                gap_bucket = "delayed"
         except ValueError:
             pass
 
@@ -66,8 +78,10 @@ def extract_fingerprint(events, trigger, end_ts):
         "trigger_metric": trigger_metric,
         "had_deploy": had_deploy,
         "had_spike": had_spike,
-        "had_errors": had_errors,
+        "error_count": error_count,
+        "has_traces": has_traces,
         "deploy_gap_s": deploy_gap_s,
+        "gap_bucket": gap_bucket,
         "event_kinds": list(event_kinds)
     }
 
@@ -77,14 +91,23 @@ def combined_similarity(fp1, fp2):
     """
     score = 0.0
     
-    # Trigger type and metric match (High Weight)
+    # Trigger type match
     if fp1.get("trigger_type") == fp2.get("trigger_type"):
-        score += 0.30
-        if fp1.get("trigger_metric") and fp1.get("trigger_metric") == fp2.get("trigger_metric"):
-            score += 0.10  # Bonus for exact metric match
+        score += 0.20
     else:
         # Significant penalty for completely different trigger types
         score -= 0.20
+
+    m1 = fp1.get("trigger_metric")
+    m2 = fp2.get("trigger_metric")
+    
+    metrics_match = False
+    if m1 and m2:
+        if m1 == m2:
+            score += 0.50  # Large bonus for exact metric match
+            metrics_match = True
+    elif not m1 and not m2:
+        metrics_match = True
 
     # Both had deploys
     if fp1.get("had_deploy") == fp2.get("had_deploy"):
@@ -94,18 +117,31 @@ def combined_similarity(fp1, fp2):
     if fp1.get("had_spike") == fp2.get("had_spike"):
         score += 0.20
 
-    # Both had errors
-    if fp1.get("had_errors") == fp2.get("had_errors"):
+    # Both had errors logic replaced with Error Count Similarity
+    ec1 = fp1.get("error_count", 0)
+    ec2 = fp2.get("error_count", 0)
+    if ec1 > 0 and ec2 > 0:
+        ratio = min(ec1, ec2) / max(ec1, ec2)
+        score += 0.15 * ratio
+    elif ec1 == 0 and ec2 == 0:
         score += 0.15
 
-    # Similar deploy gap
-    gap1 = fp1.get("deploy_gap_s", 0)
-    gap2 = fp2.get("deploy_gap_s", 0)
-    if gap1 > 0 and gap2 > 0:
-        ratio = min(gap1, gap2) / max(gap1, gap2)
-        score += 0.10 * ratio
-    elif gap1 == 0 and gap2 == 0:
-        score += 0.10  # Both zero gap
+    # Traces active
+    if fp1.get("has_traces") == fp2.get("has_traces"):
+        score += 0.05
+
+    # Gap Bucket Match
+    gb1 = fp1.get("gap_bucket", "none")
+    gb2 = fp2.get("gap_bucket", "none")
+    if gb1 == gb2 and gb1 != "none":
+        score += 0.10
+    elif gb1 == "none" and gb2 == "none":
+        score += 0.05
+
+    # Hard Multiplicative Penalty: If metrics are present but do not match, 
+    # crush the score so it never outranks a correct metric match.
+    if m1 and m2 and not metrics_match:
+        score *= 0.1
 
     # Ensure bounds between 0.0 and 1.0
     return max(0.0, min(1.0, round(score, 3)))

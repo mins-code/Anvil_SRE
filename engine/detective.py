@@ -51,16 +51,21 @@ def combined_similarity(fp_curr, fp_past, motif_curr, motif_past,
     Weighted similarity combining fingerprint signals, structural motif,
     and canonical service identity via the TIG.
 
-    Weight budget:
-      - Fingerprint (behavioral signals): 0.55
-      - Structural motif:                 0.15
+    Weight budget (maintaining TIG identity):
       - Identity overlap (TIG):           0.30
+      - Fingerprint (behavioral signals): 0.525 (75% of remaining 0.70 budget)
+      - Structural motif:                 0.175 (25% of remaining 0.70 budget)
     """
     fp_score     = fp_sim(fp_curr, fp_past)                          # 0.0–1.0
-    motif_score  = motif_similarity(motif_curr, motif_past)          # 0.0–1.0 (replaces == bool)
     id_score     = _identity_overlap_score(canon_curr, canon_past, tig)
 
-    raw = (fp_score * 0.55) + (motif_score * 0.15) + (id_score * 0.30)
+    if not motif_curr or not motif_past:
+        # Fail-soft: if either motif is missing, ignore motif similarity
+        # and reallocate its 0.175 weight budget back to the behavioral fingerprint
+        raw = (fp_score * 0.70) + (id_score * 0.30)
+    else:
+        motif_score  = motif_similarity(motif_curr, motif_past)          # 0.0–1.0
+        raw = (fp_score * 0.525) + (motif_score * 0.175) + (id_score * 0.30)
 
     # Penalise cross-service noise: if identity is unknown and scores differ,
     # apply a light penalty so unrelated services don't float past the threshold.
@@ -90,8 +95,13 @@ def reconstruct(memory, signal, mode="fast") -> dict:
 
     # Step 2: related events with trace fan-out
     if canonical_id:
+        target_ids = {canonical_id}
+        if hasattr(memory, 'tig') and memory.tig is not None:
+            ancestors = memory.tig.ancestors(canonical_id)
+            if ancestors:
+                target_ids.update(ancestors)
         initial_events = memory.get_events_in_window(
-            canonical_id, signal.get("ts"), window_minutes=20)
+            list(target_ids), signal.get("ts"), window_minutes=60)
     else:
         initial_events = []
 
@@ -109,8 +119,13 @@ def reconstruct(memory, signal, mode="fast") -> dict:
     }
     for connected_svc in connected_svc_names:
         connected_id = memory.tig.lookup(connected_svc, at_time=signal.get("ts"))
+        connected_ids = {connected_id}
+        if hasattr(memory, 'tig') and memory.tig is not None:
+            c_ancestors = memory.tig.ancestors(connected_id)
+            if c_ancestors:
+                connected_ids.update(c_ancestors)
         for e in memory.get_events_in_window(
-                connected_id, signal.get("ts"), window_minutes=20):
+                list(connected_ids), signal.get("ts"), window_minutes=60):
             eid = hashlib.md5(json.dumps(e, sort_keys=True).encode()).hexdigest()
             if eid not in seen_event_ids:
                 initial_events.append(e)
@@ -190,7 +205,7 @@ def reconstruct(memory, signal, mode="fast") -> dict:
             canon_curr=canonical_id, canon_past=canon_past,
             tig=tig,
         )
-        if sim >= 0.35:
+        if sim >= 0.15:
             id_match = canon_past == canonical_id if (canonical_id and canon_past) else None
             scored.append({
                 "incident_id": past.get("incident_id", "unknown"),
@@ -211,7 +226,7 @@ def reconstruct(memory, signal, mode="fast") -> dict:
     # Step 6: remediations
     suggested_remediations = []
     seen_actions = set()
-    for match in similar_past_incidents[:3]:
+    for match in similar_past_incidents[:5]:
         rems = memory.get_remediations_for_incident(match.get("incident_id")) if hasattr(memory, 'get_remediations_for_incident') else []
         for action, target_id, version, outcome in rems:
             action_key = (action, target_id)
