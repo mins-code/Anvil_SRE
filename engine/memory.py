@@ -156,46 +156,50 @@ class Memory:
         import json
         from datetime import datetime, timedelta
 
-        target_ids = {canonical_id}
-        if hasattr(self, 'tig') and self.tig is not None:
-            ancestors = self.tig.ancestors(canonical_id)
-            if ancestors:
-                target_ids.update(ancestors)
-                
-        id_list = list(target_ids)
-        if not id_list:
-            return []
-            
-        placeholders = ','.join(['?'] * len(id_list))
-        
-        query = f"""
-            SELECT happened_at, raw_json 
-            FROM events 
-            WHERE canonical_id IN ({placeholders})
-        """
-        all_events = self.db.execute(query, id_list).fetchall()
-        
         clean_ts = ts.replace('Z', '+00:00')
         try:
             target_time = datetime.fromisoformat(clean_ts)
         except ValueError:
             return []
-            
+
         start_time = target_time - timedelta(minutes=window_minutes)
-        
+        # Format back to ISO strings that DuckDB can compare lexicographically.
+        # The events table stores happened_at as TEXT in ISO-8601 format, which
+        # sorts correctly as a plain string, so the WHERE clause is index-friendly.
+        start_str  = start_time.isoformat()
+        end_str    = target_time.isoformat()
+
+        target_ids = {canonical_id}
+        if hasattr(self, 'tig') and self.tig is not None:
+            ancestors = self.tig.ancestors(canonical_id)
+            if ancestors:
+                target_ids.update(ancestors)
+
+        id_list = list(target_ids)
+        if not id_list:
+            return []
+
+        placeholders = ','.join(['?'] * len(id_list))
+        params = [start_str, end_str] + id_list
+
+        query = f"""
+            SELECT happened_at, raw_json
+            FROM events
+            WHERE happened_at >= ?
+              AND happened_at <= ?
+              AND canonical_id IN ({placeholders})
+            ORDER BY happened_at
+        """
+        rows = self.db.execute(query, params).fetchall()
+
         valid_events = []
-        for happened_at_str, raw_json in all_events:
-            if not happened_at_str:
-                continue
+        for happened_at_str, raw_json in rows:
             try:
-                event_time = datetime.fromisoformat(happened_at_str.replace('Z', '+00:00'))
-                if start_time <= event_time <= target_time:
-                    valid_events.append((event_time, json.loads(raw_json)))
-            except (ValueError, json.JSONDecodeError):
+                valid_events.append(json.loads(raw_json))
+            except json.JSONDecodeError:
                 continue
-                
-        valid_events.sort(key=lambda x: x[0])
-        return [e[1] for e in valid_events]
+
+        return valid_events
 
     def update_incident_record(self, incident_id: str, fingerprint: dict, causal_chain: list):
         import json
@@ -244,32 +248,66 @@ class Memory:
         return self.db.execute(query, (incident_id,)).fetchall()
 
     def store_events_batch(self, events: list):
-        self.db.execute("BEGIN")
-        try:
-            for event in events:
+        import json
+        import warnings
+        from engine.fingerprint import extract_fingerprint
+
+        # ── First pass: insert each event in its own transaction so a single
+        # malformed event does not abort the whole batch. ──────────────────
+        # Note: DuckDB does not support SAVEPOINT, so we use individual
+        # BEGIN/COMMIT micro-transactions per event.
+        failed = 0
+        for event in events:
+            try:
+                self.db.execute("BEGIN")
                 self.store_event(event)
-            self.db.execute("COMMIT")
-            
-            import json
-            from engine.fingerprint import extract_fingerprint
-            for event in events:
-                if event.get('kind') == 'incident_signal':
-                    incident_id = event.get('incident_id')
-                    happened_at = event.get('ts') or event.get('happened_at')
-                    trigger = event.get('trigger', '')
-                    
-                    row = self.db.execute("SELECT canonical_id FROM incidents WHERE incident_id = ?", (incident_id,)).fetchone()
-                    if row:
-                        canonical_id = row[0]
-                        events_in_window = self.get_events_in_window(canonical_id, happened_at, window_minutes=20)
-                        fingerprint = extract_fingerprint(events_in_window, trigger, happened_at)
-                        fingerprint_json = json.dumps(fingerprint)
-                        
-                        self.db.execute('''
-                            UPDATE incidents
-                            SET fingerprint_json = ?
-                            WHERE incident_id = ?
-                        ''', (fingerprint_json, incident_id))
-        except Exception:
-            self.db.execute("ROLLBACK")
-            raise
+                self.db.execute("COMMIT")
+            except Exception as exc:
+                try:
+                    self.db.execute("ROLLBACK")
+                except Exception:
+                    pass
+                failed += 1
+                warnings.warn(
+                    f"store_events_batch: skipped malformed event "
+                    f"(kind={event.get('kind')!r}): {exc}",
+                    stacklevel=2,
+                )
+
+        if failed:
+            warnings.warn(
+                f"store_events_batch: {failed}/{len(events)} event(s) skipped due to errors.",
+                stacklevel=2,
+            )
+
+        # ── Second pass: compute fingerprints for incident_signal events now
+        # that the full batch is committed and the event window is complete. ─
+        for event in events:
+            if event.get('kind') == 'incident_signal':
+                incident_id = event.get('incident_id')
+                happened_at = event.get('ts') or event.get('happened_at')
+                trigger     = event.get('trigger', '')
+
+                row = self.db.execute(
+                    "SELECT canonical_id FROM incidents WHERE incident_id = ?",
+                    (incident_id,)
+                ).fetchone()
+                if not row:
+                    continue
+
+                canonical_id = row[0]
+                try:
+                    events_in_window = self.get_events_in_window(
+                        canonical_id, happened_at, window_minutes=20)
+                    fingerprint      = extract_fingerprint(events_in_window, trigger, happened_at)
+                    fingerprint_json = json.dumps(fingerprint)
+                    self.db.execute(
+                        "UPDATE incidents SET fingerprint_json = ? WHERE incident_id = ?",
+                        (fingerprint_json, incident_id),
+                    )
+                except Exception as exc:
+                    warnings.warn(
+                        f"store_events_batch: fingerprint computation failed for "
+                        f"incident '{incident_id}': {exc}",
+                        stacklevel=2,
+                    )

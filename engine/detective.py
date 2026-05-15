@@ -2,7 +2,7 @@ import hashlib
 import json
 from datetime import datetime
 from engine.fingerprint import extract_fingerprint, combined_similarity as fp_sim
-from engine.motif import extract_motif, get_motif_name
+from engine.motif import extract_motif, get_motif_name, motif_similarity
 
 def temporal_confidence(ts1, ts2, base=1.0):
     """
@@ -56,9 +56,9 @@ def combined_similarity(fp_curr, fp_past, motif_curr, motif_past,
       - Structural motif:                 0.15
       - Identity overlap (TIG):           0.30
     """
-    fp_score     = fp_sim(fp_curr, fp_past)                                         # 0.0–1.0
-    motif_score  = 1.0 if motif_curr == motif_past else 0.0                         # 0.0 or 1.0
-    id_score     = _identity_overlap_score(canon_curr, canon_past, tig)             # 0.0, 0.6, or 1.0
+    fp_score     = fp_sim(fp_curr, fp_past)                          # 0.0–1.0
+    motif_score  = motif_similarity(motif_curr, motif_past)          # 0.0–1.0 (replaces == bool)
+    id_score     = _identity_overlap_score(canon_curr, canon_past, tig)
 
     raw = (fp_score * 0.55) + (motif_score * 0.15) + (id_score * 0.30)
 
