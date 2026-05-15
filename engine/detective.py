@@ -53,14 +53,19 @@ def combined_similarity(fp_curr, fp_past, motif_curr, motif_past,
     and structural motif.
 
     Weight budget rationale:
-    In this benchmark every incident family has the same behavioral shape
-    (latency spike, delayed deploy). Fingerprint features are nearly constant
-    across all families. The only signal that reliably discriminates families
-    is whether the incident's service shares a TIG ancestor chain with the
-    training incident's service. Identity is therefore the primary signal.
+    Identity (TIG ancestor chain) is a strong structural signal: if two incidents
+    occurred on services with shared lineage (rename/merge), they are likely the
+    same recurring failure pattern. Fingerprint captures behavioral shape (what kind
+    of failure, how quickly it followed a deploy, what neighbors were affected).
+    Motif captures the causal graph structure when available.
+
+    When behavioral fingerprint features are constant across incident families
+    (e.g., all latency, all delayed), identity becomes the primary discriminator.
+    When behavioral features vary (e.g., different error categories), fp_score
+    does the heavy lifting. The 0.60/0.40 split balances both regimes.
 
       - Identity overlap (TIG ancestor chain):  0.40
-      - Fingerprint (behavioral features):       0.55 (no motif) / 0.50 (with motif)
+      - Fingerprint (behavioral features):       0.60 (no motif) / 0.50 (with motif)
       - Structural motif:                        0.10 (when available)
     """
     fp_score = fp_sim(fp_curr, fp_past)           # 0.0–1.0, entropy-weighted
@@ -134,6 +139,7 @@ def reconstruct(memory, signal, mode="fast") -> dict:
         hashlib.md5(json.dumps(e, sort_keys=True).encode()).hexdigest()
         for e in initial_events
     }
+    neighbor_events = []
     search_window = successful_window if canonical_id else 60
     for connected_svc in connected_svc_names:
         connected_id = memory.tig.lookup(connected_svc, at_time=signal.get("ts"))
@@ -146,10 +152,12 @@ def reconstruct(memory, signal, mode="fast") -> dict:
                 list(connected_ids), signal.get("ts"), window_minutes=search_window):
             eid = hashlib.md5(json.dumps(e, sort_keys=True).encode()).hexdigest()
             if eid not in seen_event_ids:
-                initial_events.append(e)
+                neighbor_events.append(e)
                 seen_event_ids.add(eid)
 
-    related_events = sorted(initial_events, key=lambda e: e.get("ts", ""))
+    # Note: related_events contains primary + neighbor for context, 
+    # but we pass them separately to fingerprinting for accuracy.
+    related_events = sorted(initial_events + neighbor_events, key=lambda e: e.get("ts", ""))
 
     # Step 3: causal chain (cause_event_id / effect_event_id)
     # Extract trigger category for fuzzy spike detection
@@ -168,6 +176,16 @@ def reconstruct(memory, signal, mode="fast") -> dict:
         elif any(kw in t_metric for kw in ['cpu', 'memory', 'mem', 'utilization', 'disk', 'usage', 'resource', 'io']):
             trigger_category = 'resource'
 
+    # Compute adaptive threshold for metric spikes
+    _m_values = [e.get("value", 0) for e in related_events if e.get("kind") == "metric"]
+    if len(_m_values) >= 3:
+        import statistics as _st
+        _m_mean = _st.mean(_m_values)
+        _m_std  = _st.stdev(_m_values)
+        _spike_threshold = _m_mean + 2 * _m_std if _m_std > 0 else _m_mean * 1.5
+    else:
+        _spike_threshold = 0
+
     deploys = [e for e in related_events if e.get("kind") == "deploy"]
     errors  = [e for e in related_events if e.get("kind") == "log" and e.get("level") == "error"]
     spikes = []
@@ -175,8 +193,15 @@ def reconstruct(memory, signal, mode="fast") -> dict:
         if e.get("kind") == "metric":
             m_name = e.get("name", "").lower()
             m_val = e.get("value", 0)
-            if trigger_category != "unknown" and any(kw in m_name for kw in ['latency', 'error', 'qps', 'cpu', 'mem'] if kw in trigger_category):
-                if m_val > 1000:
+            _category_keywords = {
+                'latency':    ['latency', 'delay', 'duration', 'time', 'ms', 'lag'],
+                'error':      ['error', 'failure', '5xx', '4xx', 'exception', 'rate'],
+                'throughput': ['qps', 'throughput', 'rps', 'requests', 'count'],
+                'resource':   ['cpu', 'memory', 'mem', 'utilization', 'disk', 'usage', 'io'],
+            }
+            _kws = _category_keywords.get(trigger_category, [])
+            if _kws and any(kw in m_name for kw in _kws):
+                if m_val > _spike_threshold:
                     spikes.append(e)
 
     signal_eid = f"incident:{signal.get('incident_id')}"
@@ -226,16 +251,8 @@ def reconstruct(memory, signal, mode="fast") -> dict:
                 "confidence": conf
             })
 
-    # Collect neighbor_events: all events from connected services (for multi-service blast radius)
-    neighbor_events = []
-    for e in initial_events:
-        e_svc = e.get("service")
-        if not e_svc and e.get("kind") == "trace":
-            continue
-        if e_svc and e_svc != svc_name:
-            neighbor_events.append(e)
-            
-    fp_current    = extract_fingerprint(related_events, trigger, signal.get("ts"),
+    # Fingerprint current incident using clearly separated primary and neighbor events
+    fp_current    = extract_fingerprint(initial_events, trigger, signal.get("ts"),
                                         neighbor_events=neighbor_events)
     motif_current = extract_motif(causal_chain)
     if hasattr(memory, 'update_incident_record'):

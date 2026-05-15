@@ -337,12 +337,25 @@ class Memory:
 
                     neighbor_events = []
                     seen_eids = {hashlib.md5(json.dumps(e, sort_keys=True).encode()).hexdigest() for e in events_in_window}
+                    
+                    # Compute adaptive threshold for neighbor windows as well
                     for connected_svc in connected_svc_names:
                         c_id = self.tig.lookup(connected_svc, at_time=happened_at)
                         c_ids = {c_id}
                         c_anc = self.tig.ancestors(c_id)
                         if c_anc: c_ids.update(c_anc)
-                        for e in self.get_events_in_window(list(c_ids), happened_at, window_minutes=successful_window):
+                        
+                        n_events = self.get_events_in_window(list(c_ids), happened_at, window_minutes=successful_window)
+                        n_m_values = [e.get("value", 0) for e in n_events if e.get("kind") == "metric"]
+                        if len(n_m_values) >= 3:
+                            import statistics as _nst
+                            _nm_mean = _nst.mean(n_m_values)
+                            _nm_std  = _nst.stdev(n_m_values)
+                            _n_spike_threshold = _nm_mean + 2 * _nm_std if _nm_std > 0 else _nm_mean * 1.5
+                        else:
+                            _n_spike_threshold = _spike_threshold # fallback
+
+                        for e in n_events:
                             eid = hashlib.md5(json.dumps(e, sort_keys=True).encode()).hexdigest()
                             if eid not in seen_eids:
                                 neighbor_events.append(e)
@@ -362,7 +375,29 @@ class Memory:
                         
                     deploys = [e for e in events_in_window if e.get("kind") == "deploy"]
                     errors  = [e for e in events_in_window if e.get("kind") == "log" and e.get("level") == "error"]
-                    spikes = [e for e in events_in_window if e.get("kind") == "metric" and e.get("value", 0) > 1000 and trigger_category != "unknown" and any(kw in e.get("name", "").lower() for kw in ['latency', 'error', 'qps', 'cpu', 'mem'] if kw in trigger_category)]
+                    # Collect all metric values in this window to compute adaptive anomaly threshold.
+                    # Using mean + 2*std so the threshold adapts to any metric scale.
+                    _m_values = [e.get("value", 0) for e in events_in_window if e.get("kind") == "metric"]
+                    if len(_m_values) >= 3:
+                        import statistics as _st
+                        _m_mean = _st.mean(_m_values)
+                        _m_std  = _st.stdev(_m_values)
+                        _spike_threshold = _m_mean + 2 * _m_std if _m_std > 0 else _m_mean * 1.5
+                    else:
+                        _spike_threshold = 0
+
+                    _category_keywords = {
+                        'latency':    ['latency', 'delay', 'duration', 'time', 'ms', 'lag'],
+                        'error':      ['error', 'failure', '5xx', '4xx', 'exception', 'rate'],
+                        'throughput': ['qps', 'throughput', 'rps', 'requests', 'count'],
+                        'resource':   ['cpu', 'memory', 'mem', 'utilization', 'disk', 'usage', 'io'],
+                    }
+                    _kws = _category_keywords.get(trigger_category, [])
+                    spikes = [e for e in events_in_window
+                              if e.get("kind") == "metric"
+                              and e.get("value", 0) > _spike_threshold
+                              and _kws
+                              and any(kw in e.get("name", "").lower() for kw in _kws)]
                     
                     causal_chain = []
                     for deploy in deploys:

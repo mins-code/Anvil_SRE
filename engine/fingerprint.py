@@ -15,6 +15,7 @@ _FEATURE_WEIGHTS = {
     "has_traces":         0.10,   # tracing coverage
     "neighbor_spike_count": 0.35, # correlated blast radius — multi-service signal
     "neighbor_error_count": 0.30, # error contagion across services
+    "neighbor_canonical_sig": 0.50, # blast-radius identity: WHICH services were affected
 }
 _TOTAL_WEIGHT = sum(_FEATURE_WEIGHTS.values())
 
@@ -57,6 +58,18 @@ def extract_fingerprint(events, trigger, end_ts, neighbor_events=None):
     neighbor_spike_count = 0
     neighbor_error_count = 0
 
+    # Collect all metric values in this window to compute adaptive anomaly threshold.
+    # Using mean + 2*std so the threshold adapts to any metric scale.
+    # Falls back to absolute threshold only when there are too few samples.
+    metric_values = [e.get("value", 0) for e in events if e.get("kind") == "metric"]
+    if len(metric_values) >= 3:
+        import statistics
+        m_mean = statistics.mean(metric_values)
+        m_std  = statistics.stdev(metric_values)
+        spike_threshold = m_mean + 2 * m_std if m_std > 0 else m_mean * 1.5
+    else:
+        spike_threshold = 0  # no baseline — treat any positive value as noteworthy
+
     for e in events:
         kind = e.get("kind")
         if not kind:
@@ -72,13 +85,19 @@ def extract_fingerprint(events, trigger, end_ts, neighbor_events=None):
                     last_deploy_ts_str = ts_str
                     
         elif kind == "metric":
-            # Count anomalous metrics in the same category (value threshold > 1000).
-            # We count ALL spiking metrics including the trigger itself — if 2+ metrics
-            # spike, that's a blast-radius pattern vs an isolated single-metric spike.
+            # Count anomalous metrics: value must exceed the adaptive threshold
+            # AND be in the same semantic category as the trigger.
             m_name = e.get("name", "").lower()
             m_val = e.get("value", 0)
-            if trigger_category != "unknown" and any(kw in m_name for kw in ['latency', 'error', 'qps', 'cpu', 'mem'] if kw in trigger_category):
-                if m_val > 1000:
+            category_keywords = {
+                'latency':    ['latency', 'delay', 'duration', 'time', 'ms', 'lag'],
+                'error':      ['error', 'failure', '5xx', '4xx', 'exception', 'rate'],
+                'throughput': ['qps', 'throughput', 'rps', 'requests', 'count'],
+                'resource':   ['cpu', 'memory', 'mem', 'utilization', 'disk', 'usage', 'io'],
+            }
+            kws = category_keywords.get(trigger_category, [])
+            if kws and any(kw in m_name for kw in kws):
+                if m_val > spike_threshold:
                     spike_count += 1
                 
         elif kind == "log":
@@ -101,14 +120,40 @@ def extract_fingerprint(events, trigger, end_ts, neighbor_events=None):
         error_density = "low"
 
     # Multi-service correlated signals: count spike/error events from neighbor services
-    # that co-occurred in the same time window. This captures blast radius shape.
+    # that co-occurred in the same time window. Also capture WHICH neighbor canonicals
+    # were affected — this is the blast-radius structural fingerprint that discriminates
+    # families sharing the same primary service.
+    neighbor_canonical_sig = set()
+    # Use the same adaptive threshold for neighbor spikes
+    neighbor_metric_values = [e.get("value", 0) for e in (neighbor_events or []) if e.get("kind") == "metric"]
+    if len(neighbor_metric_values) >= 3:
+        import statistics as _stats
+        nm_mean = _stats.mean(neighbor_metric_values)
+        nm_std  = _stats.stdev(neighbor_metric_values)
+        neighbor_spike_threshold = nm_mean + 2 * nm_std if nm_std > 0 else nm_mean * 1.5
+    elif metric_values:
+        neighbor_spike_threshold = spike_threshold  # fall back to primary window threshold
+    else:
+        neighbor_spike_threshold = 0
+
     if neighbor_events:
         for e in neighbor_events:
             ne_kind = e.get("kind", "")
-            if ne_kind == "metric":
+            cid = e.get("canonical_id") or e.get("service")
+            if not cid: continue
+            
+            if ne_kind == "metric" and e.get("value", 0) > neighbor_spike_threshold:
                 neighbor_spike_count += 1
+                m_name = e.get("name", "metric")
+                neighbor_canonical_sig.add(f"{cid}:metric:{m_name}")
             elif ne_kind == "log" and e.get("level") == "error":
                 neighbor_error_count += 1
+                neighbor_canonical_sig.add(f"{cid}:log:error")
+            elif ne_kind == "trace":
+                for span in e.get("spans", []):
+                    span_svc = span.get("svc")
+                    if span_svc:
+                        neighbor_canonical_sig.add(f"{cid}:trace:{span_svc}")
 
     # Bucket neighbor signals structurally (not raw integers)
     def _bucket(n):
@@ -155,6 +200,7 @@ def extract_fingerprint(events, trigger, end_ts, neighbor_events=None):
         "event_kinds":          list(event_kinds),
         "neighbor_spike_count": neighbor_spike_bucket,
         "neighbor_error_count": neighbor_error_bucket,
+        "neighbor_canonical_sig": sorted(neighbor_canonical_sig),  # blast-radius identity
     }
 
 def combined_similarity(fp1, fp2):
@@ -245,8 +291,25 @@ def combined_similarity(fp1, fp2):
         if ne1 == ne2:
             earned += w
 
+    # --- neighbor_canonical_sig (blast-radius identity: Jaccard similarity) ---
+    # This is the primary discriminator when multiple families share the same primary service.
+    # If family A and family B are on svc-X, but cascade into different downstream services,
+    # this feature correctly separates them.
+    w = _FEATURE_WEIGHTS["neighbor_canonical_sig"]
+    sig1 = set(fp1.get("neighbor_canonical_sig", []))
+    sig2 = set(fp2.get("neighbor_canonical_sig", []))
+    if sig1 or sig2:
+        budget += w
+        union = sig1 | sig2
+        if union:
+            jaccard = len(sig1 & sig2) / len(union)
+            earned += w * jaccard
+
     # Normalise against actually-present features to avoid penalising sparse data
     score = (earned / budget) if budget > 0 else 0.0
+    
+    # DEBUG ONLY: Track feature scores for cross-family collisions
+    # print(f"  [SIM] earned={earned:.2f} budget={budget:.2f} score={score:.3f}")
 
     # Hard Multiplicative Penalty: cross-family match can never rescue itself
     # via identity or deploy overlap. Crush to ~10% of score.
