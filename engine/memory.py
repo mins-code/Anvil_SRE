@@ -26,6 +26,8 @@ class Memory:
                 happened_at      TEXT,
                 canonical_id     TEXT,
                 trigger          TEXT,
+                trigger_type     TEXT,
+                trigger_metric   TEXT,
                 fingerprint_json TEXT,
                 causal_json      TEXT
             );
@@ -90,18 +92,52 @@ class Memory:
                 spans = event.get('spans', [])
                 if spans:
                     service_name = spans[0].get('svc')
+            elif kind == 'incident_signal':
+                service_name = event.get('service') or event.get('trigger', '').split('/')[0].split(':')[1] if ':' in event.get('trigger', '') else None
+            elif kind == 'remediation':
+                service_name = event.get('target')
             
-            # Resolve to canonical_id (assuming TIG or NameBook has a lookup method)
+            # Resolve to canonical_id
             canonical_id = service_name
             if hasattr(self, 'tig') and self.tig is not None and service_name:
-                # Placeholder for TIG lookup
-                pass
+                # Use TIG lookup if available
+                if hasattr(self.tig, 'lookup'):
+                    canonical_id = self.tig.lookup(service_name, at_time=happened_at)
 
             self.db.execute('''
                 INSERT OR IGNORE INTO events 
                 (event_id, happened_at, kind, canonical_id, service_name, raw_json)
                 VALUES (?, ?, ?, ?, ?, ?)
             ''', (event_id, happened_at, kind, canonical_id, service_name, raw_json))
+            
+            if kind == 'incident_signal':
+                incident_id = event.get('incident_id')
+                trigger = event.get('trigger', '')
+                
+                trigger_type = ''
+                trigger_metric = ''
+                if ':' in trigger and '/' in trigger:
+                    trigger_type = trigger.split(':')[0]
+                    trigger_metric = trigger.split('/')[1].split('>')[0].split('<')[0].split('=')[0]
+                
+                self.db.execute('''
+                    INSERT OR IGNORE INTO incidents
+                    (incident_id, happened_at, canonical_id, trigger, trigger_type, trigger_metric)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                ''', (incident_id, happened_at, canonical_id, trigger, trigger_type, trigger_metric))
+                
+            elif kind == 'remediation':
+                incident_id = event.get('incident_id')
+                action = event.get('action')
+                target_id = canonical_id
+                version = event.get('version')
+                outcome = event.get('outcome')
+                
+                self.db.execute('''
+                    INSERT INTO remediations
+                    (incident_id, action, target_id, version, outcome, happened_at)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                ''', (incident_id, action, target_id, version, outcome, happened_at))
 
     def get_events_in_window(self, canonical_id: str, ts: str, window_minutes: int = 20):
         import json

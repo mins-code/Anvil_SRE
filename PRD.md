@@ -7,7 +7,7 @@
 ---
 
 ## 0. Read This First
-
+    
 This document supersedes v2 entirely. It is produced by cross-referencing every
 line of the public benchmark harness (schema.py, generator.py, harness.py,
 metrics.py, adapter.py, adapters/dummy.py) against the v2 PRD.
