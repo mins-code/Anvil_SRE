@@ -1,10 +1,12 @@
 import duckdb
+from engine.temporal_identity_graph import TemporalIdentityGraph
 
 class Memory:
     def __init__(self):
         # Connect to an in-memory DuckDB database
         self.db = duckdb.connect(":memory:")
         self._initialize_tables()
+        self.tig = TemporalIdentityGraph()
 
     def _initialize_tables(self):
         # Every event that has ever been ingested
@@ -229,3 +231,13 @@ class Memory:
             WHERE incident_id = ?
         """
         return self.db.execute(query, (incident_id,)).fetchall()
+
+    def store_events_batch(self, events: list):
+        self.db.execute("BEGIN")
+        try:
+            for event in events:
+                self.store_event(event)
+            self.db.execute("COMMIT")
+        except Exception:
+            self.db.execute("ROLLBACK")
+            raise
