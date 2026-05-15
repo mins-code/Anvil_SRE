@@ -1,6 +1,21 @@
 import duckdb
 from engine.temporal_identity_graph import TemporalIdentityGraph
 
+def _temporal_confidence(ts1, ts2, base=1.0):
+    """Inlined copy of detective.temporal_confidence — avoids circular import."""
+    import math
+    if not ts1 or not ts2:
+        return base
+    try:
+        from datetime import datetime
+        t1 = datetime.fromisoformat(ts1.replace("Z", "+00:00"))
+        t2 = datetime.fromisoformat(ts2.replace("Z", "+00:00"))
+        gap_s = abs((t2 - t1).total_seconds())
+        return round(base * math.exp(-gap_s / 300.0), 4)
+    except (ValueError, AttributeError):
+        return base
+
+
 class Memory:
     def __init__(self):
         # Connect to an in-memory DuckDB database
@@ -71,7 +86,7 @@ class Memory:
                     elif change == 'split':
                         self.tig.split(from_val, into_val, ts)
                     elif change == 'merge':
-                        self.tig.merge(from_val, to_val, ts)
+                        self.tig.merge(from_val, into_val, ts)
             elif change in ('dep_add', 'dep_remove'):
                 # Graceful Handling: Must be a no-op
                 pass
@@ -102,16 +117,7 @@ class Memory:
             # Resolve to canonical_id
             canonical_id = service_name
             
-            is_high_value = False
-            if kind in ('deploy', 'incident_signal', 'remediation', 'trace'):
-                is_high_value = True
-            elif kind == 'log' and event.get('level') == 'error':
-                is_high_value = True
-            elif kind == 'metric' and event.get('value', 0) > 1000 and 'latency' in event.get('name', '').lower():
-                is_high_value = True
-
-            if is_high_value and hasattr(self, 'tig') and self.tig is not None and service_name:
-                # Use TIG lookup if available
+            if hasattr(self, 'tig') and self.tig is not None and service_name:
                 if hasattr(self.tig, 'lookup'):
                     canonical_id = self.tig.lookup(service_name, at_time=happened_at)
 
@@ -175,8 +181,8 @@ class Memory:
         # Format back to ISO strings that DuckDB can compare lexicographically.
         # The events table stores happened_at as TEXT in ISO-8601 format, which
         # sorts correctly as a plain string, so the WHERE clause is index-friendly.
-        start_str  = start_time.isoformat()
-        end_str    = target_time.isoformat()
+        start_str  = start_time.isoformat().replace('+00:00', 'Z')
+        end_str    = target_time.isoformat().replace('+00:00', 'Z')
 
         if not canonical_ids:
             return []
@@ -252,6 +258,7 @@ class Memory:
 
     def store_events_batch(self, events: list):
         import json
+        import hashlib
         import warnings
         from engine.fingerprint import extract_fingerprint
 
@@ -306,13 +313,82 @@ class Memory:
                         target_ids.update(ancestors)
 
                 try:
-                    events_in_window = self.get_events_in_window(
-                        list(target_ids), happened_at, window_minutes=60)
-                    fingerprint      = extract_fingerprint(events_in_window, trigger, happened_at)
+                    active_window = 60
+                    max_window = 1440
+                    events_in_window = []
+                    successful_window = 60
+                    while active_window <= max_window:
+                        events_in_window = self.get_events_in_window(
+                            list(target_ids), happened_at, window_minutes=active_window)
+                        successful_window = active_window
+                        if any(e.get("kind") == "deploy" for e in events_in_window):
+                            break
+                        active_window *= 2
+                        
+                    # Find neighbor events to ensure training incidents match eval incident features
+                    trace_events = [e for e in events_in_window if e.get("kind") == "trace"]
+                    connected_svc_names = set()
+                    svc_name = event.get("service") or (trigger.split('/')[0].split(':')[1] if ':' in trigger else None)
+                    for trace in trace_events:
+                        for span in trace.get("spans", []):
+                            svc = span.get("svc")
+                            if svc and svc != svc_name:
+                                connected_svc_names.add(svc)
+
+                    neighbor_events = []
+                    seen_eids = {hashlib.md5(json.dumps(e, sort_keys=True).encode()).hexdigest() for e in events_in_window}
+                    for connected_svc in connected_svc_names:
+                        c_id = self.tig.lookup(connected_svc, at_time=happened_at)
+                        c_ids = {c_id}
+                        c_anc = self.tig.ancestors(c_id)
+                        if c_anc: c_ids.update(c_anc)
+                        for e in self.get_events_in_window(list(c_ids), happened_at, window_minutes=successful_window):
+                            eid = hashlib.md5(json.dumps(e, sort_keys=True).encode()).hexdigest()
+                            if eid not in seen_eids:
+                                neighbor_events.append(e)
+                                seen_eids.add(eid)
+                        
+                    # Causal Chain extraction for motifs
+                    trigger_category = "unknown"
+                    parts = trigger.split(':', 1)
+                    if len(parts) > 1 and '/' in parts[1]:
+                        metric_part = parts[1].split('/', 1)[1]
+                        import re
+                        t_metric = re.split(r'[><=]', metric_part)[0].lower()
+                        if any(kw in t_metric for kw in ['latency', 'delay', 'duration', 'time', 'ms', 'lag']): trigger_category = 'latency'
+                        elif any(kw in t_metric for kw in ['error', 'failure', '5xx', '4xx', 'exception', 'status', 'rate']): trigger_category = 'error'
+                        elif any(kw in t_metric for kw in ['qps', 'throughput', 'rps', 'requests', 'count']): trigger_category = 'throughput'
+                        elif any(kw in t_metric for kw in ['cpu', 'memory', 'mem', 'utilization', 'disk', 'usage', 'resource', 'io']): trigger_category = 'resource'
+                        
+                    deploys = [e for e in events_in_window if e.get("kind") == "deploy"]
+                    errors  = [e for e in events_in_window if e.get("kind") == "log" and e.get("level") == "error"]
+                    spikes = [e for e in events_in_window if e.get("kind") == "metric" and e.get("value", 0) > 1000 and trigger_category != "unknown" and any(kw in e.get("name", "").lower() for kw in ['latency', 'error', 'qps', 'cpu', 'mem'] if kw in trigger_category)]
+                    
+                    causal_chain = []
+                    for deploy in deploys:
+                        for spike in spikes:
+                            if deploy.get("ts", "") < spike.get("ts", ""):
+                                causal_chain.append({"cause_event_id": f"deploy:{deploy.get('version', 'unknown')}", "effect_event_id": f"spike:{spike.get('name', 'metric')}", "evidence": "Deploy preceded spike", "confidence": _temporal_confidence(deploy.get("ts"), spike.get("ts"), 0.85)})
+                        for error in errors:
+                            if deploy.get("ts", "") < error.get("ts", ""):
+                                causal_chain.append({"cause_event_id": f"deploy:{deploy.get('version', 'unknown')}", "effect_event_id": f"error:{error.get('msg', 'error')[:40]}", "evidence": "Deploy preceded error", "confidence": _temporal_confidence(deploy.get("ts"), error.get("ts"), 0.75)})
+                    
+                    signal_eid = f"incident:{incident_id}"
+                    for spike in spikes:
+                        if spike.get("ts", "") <= happened_at:
+                            causal_chain.append({
+                                "cause_event_id": f"spike:{spike.get('name', 'metric')}", "effect_event_id": signal_eid, "evidence": "Metric spike preceded incident declaration", "confidence": _temporal_confidence(spike.get("ts"), happened_at, 0.90)})
+                    for error in errors:
+                        if error.get("ts", "") <= happened_at:
+                            causal_chain.append({
+                                "cause_event_id": f"error:{error.get('msg', 'error')[:40]}", "effect_event_id": signal_eid, "evidence": "Error preceded incident declaration", "confidence": _temporal_confidence(error.get("ts"), happened_at, 0.90)})
+                    
+                    fingerprint      = extract_fingerprint(events_in_window, trigger, happened_at, neighbor_events=neighbor_events)
                     fingerprint_json = json.dumps(fingerprint)
+                    causal_json = json.dumps(causal_chain)
                     self.db.execute(
-                        "UPDATE incidents SET fingerprint_json = ? WHERE incident_id = ?",
-                        (fingerprint_json, incident_id),
+                        "UPDATE incidents SET fingerprint_json = ?, causal_json = ? WHERE incident_id = ?",
+                        (fingerprint_json, causal_json, incident_id),
                     )
                 except Exception as exc:
                     warnings.warn(

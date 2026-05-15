@@ -98,18 +98,21 @@ class TemporalIdentityGraph:
             self._add_edge(from_id=old_id, to_id=new_id, kind="merge", ts=ts)
 
     def ancestors(self, canonical_id: str) -> Set[str]:
-        """Recursive lookup of a service's history across renames."""
+        """Recursive lookup of a service's history across renames, including historical names."""
         visited = set()
+        result = set()
         stack = [canonical_id]
         
         while stack:
             current_id = stack.pop()
             if current_id not in visited:
                 visited.add(current_id)
+                result.add(current_id)
+                
                 for edge in self._backward_edges.get(current_id, []):
                     stack.append(edge.from_id)
                     
-        return visited
+        return result
 
     def current_name(self, canonical_id: str) -> str:
         """Find the current active name for a canonical ID by following forward edges."""

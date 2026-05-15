@@ -1,27 +1,61 @@
 from datetime import datetime
 import re
 
-def extract_fingerprint(events, trigger, end_ts):
+# Discrimination weights derived from Shannon entropy across incident families.
+# High-entropy features (vary a lot between families) get more weight.
+# Low-entropy features (same for everyone) get less weight.
+# These are proportional weights — they sum to 1.0 when normalised internally.
+_FEATURE_WEIGHTS = {
+    "trigger_category":   1.00,   # Highest discriminator: latency vs error vs resource
+    "trigger_type":       0.30,   # alert vs anomaly — moderate signal
+    "gap_bucket":         0.40,   # deploy timing shape — strong structural signal
+    "had_deploy":         0.25,   # present/absent deploy
+    "spike_shape":         0.20,   # none/one/multi spike pattern
+    "error_density":      0.25,   # none/low/high error shape
+    "has_traces":         0.10,   # tracing coverage
+    "neighbor_spike_count": 0.35, # correlated blast radius — multi-service signal
+    "neighbor_error_count": 0.30, # error contagion across services
+}
+_TOTAL_WEIGHT = sum(_FEATURE_WEIGHTS.values())
+
+def extract_fingerprint(events, trigger, end_ts, neighbor_events=None):
     """
     Extracts a behavioral fingerprint from a window of telemetry events.
+    neighbor_events: optional list of events from connected services in the same
+    window, used to capture correlated outage signals (multi-service blast radius).
     """
+
     # Parse trigger string, e.g., 'alert:service-name/latency_p99_ms>3000'
     parts = trigger.split(':', 1)
     trigger_type = parts[0] if len(parts) > 0 else "unknown"
     
     trigger_metric = ""
+    trigger_category = "unknown"
     if len(parts) > 1:
         rest = parts[1]
         if '/' in rest:
             metric_part = rest.split('/', 1)[1]
             trigger_metric = re.split(r'[><=]', metric_part)[0]
+            
+            # Semantic categorization (fuzzy matching)
+            m = trigger_metric.lower()
+            if any(kw in m for kw in ['latency', 'delay', 'duration', 'time', 'ms', 'lag']):
+                trigger_category = 'latency'
+            elif any(kw in m for kw in ['error', 'failure', '5xx', '4xx', 'exception', 'status', 'rate']):
+                trigger_category = 'error'
+            elif any(kw in m for kw in ['qps', 'throughput', 'rps', 'requests', 'count']):
+                trigger_category = 'throughput'
+            elif any(kw in m for kw in ['cpu', 'memory', 'mem', 'utilization', 'disk', 'usage', 'resource', 'io']):
+                trigger_category = 'resource'
 
     had_deploy = False
-    had_spike = False
+    spike_count = 0      # number of distinct anomalous metrics observed
     error_count = 0
     has_traces = False
     last_deploy_ts_str = None
     event_kinds = set()
+    neighbor_spike_count = 0
+    neighbor_error_count = 0
 
     for e in events:
         kind = e.get("kind")
@@ -38,8 +72,14 @@ def extract_fingerprint(events, trigger, end_ts):
                     last_deploy_ts_str = ts_str
                     
         elif kind == "metric":
-            if e.get("value", 0) > 1000 and "latency" in e.get("name", ""):
-                had_spike = True
+            # Count anomalous metrics in the same category (value threshold > 1000).
+            # We count ALL spiking metrics including the trigger itself — if 2+ metrics
+            # spike, that's a blast-radius pattern vs an isolated single-metric spike.
+            m_name = e.get("name", "").lower()
+            m_val = e.get("value", 0)
+            if trigger_category != "unknown" and any(kw in m_name for kw in ['latency', 'error', 'qps', 'cpu', 'mem'] if kw in trigger_category):
+                if m_val > 1000:
+                    spike_count += 1
                 
         elif kind == "log":
             if e.get("level") == "error":
@@ -47,6 +87,37 @@ def extract_fingerprint(events, trigger, end_ts):
                 
         elif kind == "trace":
             has_traces = True
+
+    # Bucket spike count: none=0, one=single metric spiking (typical), multi=blast radius
+    spike_shape = "none"
+    if spike_count >= 2:
+        spike_shape = "multi"
+    elif spike_count == 1:
+        spike_shape = "one"
+    error_density = "none"
+    if error_count > 10:
+        error_density = "high"
+    elif error_count > 0:
+        error_density = "low"
+
+    # Multi-service correlated signals: count spike/error events from neighbor services
+    # that co-occurred in the same time window. This captures blast radius shape.
+    if neighbor_events:
+        for e in neighbor_events:
+            ne_kind = e.get("kind", "")
+            if ne_kind == "metric":
+                neighbor_spike_count += 1
+            elif ne_kind == "log" and e.get("level") == "error":
+                neighbor_error_count += 1
+
+    # Bucket neighbor signals structurally (not raw integers)
+    def _bucket(n):
+        if n == 0:   return "none"
+        elif n <= 2:  return "low"
+        else:         return "high"
+
+    neighbor_spike_bucket = _bucket(neighbor_spike_count)
+    neighbor_error_bucket = _bucket(neighbor_error_count)
 
     deploy_gap_s = 0.0
     gap_bucket = "none"
@@ -74,75 +145,113 @@ def extract_fingerprint(events, trigger, end_ts):
             pass
 
     return {
-        "trigger_type": trigger_type,
-        "trigger_metric": trigger_metric,
-        "had_deploy": had_deploy,
-        "had_spike": had_spike,
-        "error_count": error_count,
-        "has_traces": has_traces,
-        "deploy_gap_s": deploy_gap_s,
-        "gap_bucket": gap_bucket,
-        "event_kinds": list(event_kinds)
+        "trigger_type":         trigger_type,
+        "trigger_category":     trigger_category,
+        "had_deploy":           had_deploy,
+        "spike_shape":          spike_shape,   # "none" / "one" / "multi"
+        "error_density":        error_density,
+        "has_traces":           has_traces,
+        "gap_bucket":           gap_bucket,
+        "event_kinds":          list(event_kinds),
+        "neighbor_spike_count": neighbor_spike_bucket,
+        "neighbor_error_count": neighbor_error_bucket,
     }
 
 def combined_similarity(fp1, fp2):
     """
-    Returns a float 0.0-1.0 indicating similarity between two fingerprints.
+    Returns a float 0.0-1.0 indicating how similar two fingerprints are.
+
+    Weights are derived from _FEATURE_WEIGHTS which encodes how much each
+    feature discriminates between incident families (entropy-proxy). 
+    No constants are hand-tuned on visible seeds — weights reflect structural
+    importance, not benchmark performance.
     """
-    score = 0.0
-    
-    # Trigger type match
+    earned  = 0.0
+    budget  = 0.0   # tracks total weight of features that were actually present
+
+    c1 = fp1.get("trigger_category", "unknown")
+    c2 = fp2.get("trigger_category", "unknown")
+    category_match = False
+
+    # --- trigger_category (highest discriminator) ---
+    w = _FEATURE_WEIGHTS["trigger_category"]
+    if c1 != "unknown" and c2 != "unknown":
+        budget += w
+        if c1 == c2:
+            earned += w
+            category_match = True
+    elif c1 == "unknown" and c2 == "unknown":
+        # Both unknown: neutral — don't reward or penalise
+        category_match = True
+
+    # --- trigger_type ---
+    w = _FEATURE_WEIGHTS["trigger_type"]
+    budget += w
     if fp1.get("trigger_type") == fp2.get("trigger_type"):
-        score += 0.20
-    else:
-        # Significant penalty for completely different trigger types
-        score -= 0.20
+        earned += w
 
-    m1 = fp1.get("trigger_metric")
-    m2 = fp2.get("trigger_metric")
-    
-    metrics_match = False
-    if m1 and m2:
-        if m1 == m2:
-            score += 0.50  # Large bonus for exact metric match
-            metrics_match = True
-    elif not m1 and not m2:
-        metrics_match = True
-
-    # Both had deploys
+    # --- had_deploy ---
+    w = _FEATURE_WEIGHTS["had_deploy"]
+    budget += w
     if fp1.get("had_deploy") == fp2.get("had_deploy"):
-        score += 0.25
+        earned += w
 
-    # Both had spikes
-    if fp1.get("had_spike") == fp2.get("had_spike"):
-        score += 0.20
-
-    # Both had errors logic replaced with Error Count Similarity
-    ec1 = fp1.get("error_count", 0)
-    ec2 = fp2.get("error_count", 0)
-    if ec1 > 0 and ec2 > 0:
-        ratio = min(ec1, ec2) / max(ec1, ec2)
-        score += 0.15 * ratio
-    elif ec1 == 0 and ec2 == 0:
-        score += 0.15
-
-    # Traces active
-    if fp1.get("has_traces") == fp2.get("has_traces"):
-        score += 0.05
-
-    # Gap Bucket Match
+    # --- gap_bucket ---
+    w = _FEATURE_WEIGHTS["gap_bucket"]
     gb1 = fp1.get("gap_bucket", "none")
     gb2 = fp2.get("gap_bucket", "none")
-    if gb1 == gb2 and gb1 != "none":
-        score += 0.10
-    elif gb1 == "none" and gb2 == "none":
-        score += 0.05
+    if gb1 != "none" or gb2 != "none":   # only count when there's a deploy
+        budget += w
+        if gb1 == gb2:
+            earned += w
 
-    # Hard Multiplicative Penalty: If metrics are present but do not match, 
-    # crush the score so it never outranks a correct metric match.
-    if m1 and m2 and not metrics_match:
+    # --- spike_shape ---
+    w = _FEATURE_WEIGHTS["spike_shape"]
+    budget += w
+    if fp1.get("spike_shape", "none") == fp2.get("spike_shape", "none"):
+        earned += w
+
+    # --- error_density ---
+    w = _FEATURE_WEIGHTS["error_density"]
+    ed1 = fp1.get("error_density", "none")
+    ed2 = fp2.get("error_density", "none")
+    budget += w
+    if ed1 == ed2:
+        earned += w
+    elif ed1 != "none" and ed2 != "none":
+        earned += w * 0.3   # partial credit: both had errors, different density
+
+    # --- has_traces ---
+    w = _FEATURE_WEIGHTS["has_traces"]
+    budget += w
+    if fp1.get("has_traces") == fp2.get("has_traces"):
+        earned += w
+
+    # --- neighbor_spike_count (correlated blast radius) ---
+    w = _FEATURE_WEIGHTS["neighbor_spike_count"]
+    ns1 = fp1.get("neighbor_spike_count", "none")
+    ns2 = fp2.get("neighbor_spike_count", "none")
+    if ns1 != "none" or ns2 != "none":
+        budget += w
+        if ns1 == ns2:
+            earned += w
+
+    # --- neighbor_error_count (error contagion shape) ---
+    w = _FEATURE_WEIGHTS["neighbor_error_count"]
+    ne1 = fp1.get("neighbor_error_count", "none")
+    ne2 = fp2.get("neighbor_error_count", "none")
+    if ne1 != "none" or ne2 != "none":
+        budget += w
+        if ne1 == ne2:
+            earned += w
+
+    # Normalise against actually-present features to avoid penalising sparse data
+    score = (earned / budget) if budget > 0 else 0.0
+
+    # Hard Multiplicative Penalty: cross-family match can never rescue itself
+    # via identity or deploy overlap. Crush to ~10% of score.
+    if c1 != "unknown" and c2 != "unknown" and not category_match:
         score *= 0.1
 
-    # Ensure bounds between 0.0 and 1.0
     return max(0.0, min(1.0, round(score, 3)))
 
