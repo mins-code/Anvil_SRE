@@ -255,6 +255,7 @@ def reconstruct(memory, signal, mode="fast") -> dict:
     fp_current    = extract_fingerprint(initial_events, trigger, signal.get("ts"),
                                         neighbor_events=neighbor_events)
     fp_current["triggering_version"] = deploys[-1].get("version", "") if deploys else ""
+    print(f"[FP_EVAL] {signal.get('incident_id')} triggering_version={fp_current.get('triggering_version')}")
     motif_current = extract_motif(causal_chain)
     if hasattr(memory, 'update_incident_record'):
         memory.update_incident_record(incident_id, fp_current, causal_chain)
@@ -282,6 +283,33 @@ def reconstruct(memory, signal, mode="fast") -> dict:
     # Relative threshold: sort by score, then find the natural gap in distribution.
     # This avoids a fixed cutoff that breaks when score distributions shift at L3.
     all_scored.sort(key=lambda x: x[0], reverse=True)
+    
+    # Re-rank: among lineage candidates, prioritize version match
+    eval_deploy_version = fp_current.get("triggering_version", "")
+    if eval_deploy_version:
+        def _rerank_key(item):
+            sim, past = item
+            fp_past = past.get("fingerprint", {})
+            past_version = fp_past.get("triggering_version", "")
+            # Exact version match → boost to top
+            if past_version == eval_deploy_version:
+                return (1, sim)
+            # Same major.minor → second tier
+            def _maj_min(v):
+                p = v.lstrip("vV").split(".")
+                return ".".join(p[:2]) if len(p) >= 2 else v
+            if _maj_min(past_version) == _maj_min(eval_deploy_version):
+                return (0.5, sim)
+            return (0, sim)
+        
+        lineage_scored = [(sim, past) for sim, past in all_scored
+                          if _identity_overlap_score(canonical_id, past.get("canonical_id"), tig) > 0]
+        non_lineage_scored = [(sim, past) for sim, past in all_scored
+                              if _identity_overlap_score(canonical_id, past.get("canonical_id"), tig) == 0]
+        
+        lineage_scored.sort(key=_rerank_key, reverse=True)
+        all_scored = lineage_scored + non_lineage_scored
+
     scored = []
     
     # Pass 1: candidates with TIG lineage overlap

@@ -441,6 +441,8 @@ class Memory:
                     fingerprint["triggering_version"] = triggering_version
                     fingerprint["resolved_version"] = resolved_version
                     
+                    print(f"[FP] {incident_id} triggering_version={fingerprint.get('triggering_version')} resolved_version={fingerprint.get('resolved_version')}")
+                    
                     fingerprint_json = json.dumps(fingerprint)
                     causal_json = json.dumps(causal_chain)
                     self.db.execute(
