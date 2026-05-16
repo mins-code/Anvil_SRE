@@ -62,6 +62,14 @@ class Memory:
             );
         """)
 
+        # Performance indexes for window queries
+        self.db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_events_lookup ON events (canonical_id, happened_at);
+        """)
+        self.db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_remediations_lookup ON remediations (incident_id);
+        """)
+
     def store_event(self, event: dict):
         import json
         import hashlib
@@ -262,27 +270,101 @@ class Memory:
         import warnings
         from engine.fingerprint import extract_fingerprint
 
-        # ── First pass: insert each event in its own transaction so a single
-        # malformed event does not abort the whole batch. ──────────────────
-        # Note: DuckDB does not support SAVEPOINT, so we use individual
-        # BEGIN/COMMIT micro-transactions per event.
+        # ── First pass: Accumulate events and perform bulk inserts ───────────
+        events_tuples = []
+        incidents_tuples = []
+        remediations_tuples = []
         failed = 0
+
         for event in events:
             try:
-                self.db.execute("BEGIN")
-                self.store_event(event)
-                self.db.execute("COMMIT")
+                event_id = event.get('event_id')
+                if not event_id:
+                    raw = json.dumps(event, sort_keys=True)
+                    event_id = hashlib.md5(raw.encode()).hexdigest()
+                    
+                kind = event.get('kind', 'unknown')
+                happened_at = event.get('ts') or event.get('happened_at')
+                
+                if not happened_at:
+                    failed += 1
+                    continue
+                
+                raw_json = json.dumps(event)
+                
+                # Extract service_name depending on event kind
+                service_name = None
+                if kind in ('deploy', 'log', 'metric'):
+                    service_name = event.get('service')
+                elif kind == 'trace':
+                    spans = event.get('spans', [])
+                    if spans:
+                        service_name = spans[0].get('svc')
+                elif kind == 'incident_signal':
+                    trigger = event.get('trigger', '')
+                    service_name = event.get('service') or (trigger.split('/')[0].split(':')[1] if ':' in trigger else None)
+                elif kind == 'remediation':
+                    service_name = event.get('target')
+                
+                # Resolve to canonical_id only for low-volume, high-value events
+                canonical_id = service_name
+                if kind in ('deploy', 'log', 'incident_signal', 'remediation'):
+                    if hasattr(self, 'tig') and self.tig is not None and service_name:
+                        if hasattr(self.tig, 'lookup'):
+                            canonical_id = self.tig.lookup(service_name, at_time=happened_at)
+                            
+                events_tuples.append((event_id, happened_at, kind, canonical_id, service_name, raw_json))
+                
+                if kind == 'incident_signal':
+                    incident_id = event.get('incident_id')
+                    trigger = event.get('trigger')
+                    if incident_id:
+                        incidents_tuples.append((incident_id, canonical_id, trigger))
+                elif kind == 'remediation':
+                    incident_id = event.get('incident_id')
+                    action = event.get('action')
+                    target_id = canonical_id
+                    version = event.get('version')
+                    outcome = event.get('outcome')
+                    
+                    if target_id is None:
+                        warnings.warn(
+                            f"Skipping remediation record for incident '{incident_id}': "
+                            f"could not resolve a canonical_id for target service "
+                            f"(raw target={event.get('target')!r}).",
+                            stacklevel=2,
+                        )
+                    else:
+                        remediations_tuples.append((incident_id, action, target_id, version, outcome, happened_at))
+
             except Exception as exc:
-                try:
-                    self.db.execute("ROLLBACK")
-                except Exception:
-                    pass
                 failed += 1
                 warnings.warn(
                     f"store_events_batch: skipped malformed event "
                     f"(kind={event.get('kind')!r}): {exc}",
                     stacklevel=2,
                 )
+
+        if events_tuples:
+            self.db.executemany('''
+                INSERT OR IGNORE INTO events 
+                (event_id, happened_at, kind, canonical_id, service_name, raw_json)
+                VALUES (?, ?, ?, ?, ?, ?)
+            ''', events_tuples)
+            
+        if incidents_tuples:
+            self.db.executemany('''
+                INSERT OR IGNORE INTO incidents 
+                (incident_id, canonical_id, trigger)
+                VALUES (?, ?, ?)
+            ''', incidents_tuples)
+            
+        if remediations_tuples:
+            self.db.executemany('''
+                INSERT INTO remediations
+                (incident_id, action, target_id, version, outcome, happened_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+            ''', remediations_tuples)
 
         if failed:
             warnings.warn(
@@ -328,12 +410,7 @@ class Memory:
                     # Find neighbor events to ensure training incidents match eval incident features
                     trace_events = [e for e in events_in_window if e.get("kind") == "trace"]
                     connected_svc_names = set()
-                    svc_name = event.get("service")
-                    if not svc_name and ':' in trigger and '/' in trigger:
-                        try:
-                            svc_name = trigger.split(':', 1)[1].split('/')[0]
-                        except (IndexError, AttributeError):
-                            svc_name = None
+                    svc_name = event.get("service") or (trigger.split('/')[0].split(':')[1] if ':' in trigger else None)
                     for trace in trace_events:
                         for span in trace.get("spans", []):
                             svc = span.get("svc")
@@ -342,19 +419,7 @@ class Memory:
 
                     neighbor_events = []
                     seen_eids = {hashlib.md5(json.dumps(e, sort_keys=True).encode()).hexdigest() for e in events_in_window}
-
-                    # Compute primary spike threshold BEFORE the neighbor loop so
-                    # that the fallback reference inside the loop is always valid.
-                    # Using mean + 2*std so the threshold adapts to any metric scale.
-                    _m_values = [e.get("value", 0) for e in events_in_window if e.get("kind") == "metric"]
-                    if len(_m_values) >= 3:
-                        import statistics as _st
-                        _m_mean = _st.mean(_m_values)
-                        _m_std  = _st.stdev(_m_values)
-                        _spike_threshold = _m_mean + 2 * _m_std if _m_std > 0 else _m_mean * 1.5
-                    else:
-                        _spike_threshold = 0
-
+                    
                     # Compute adaptive threshold for neighbor windows as well
                     for connected_svc in connected_svc_names:
                         c_id = self.tig.lookup(connected_svc, at_time=happened_at)
@@ -370,7 +435,7 @@ class Memory:
                             _nm_std  = _nst.stdev(n_m_values)
                             _n_spike_threshold = _nm_mean + 2 * _nm_std if _nm_std > 0 else _nm_mean * 1.5
                         else:
-                            _n_spike_threshold = _spike_threshold  # fallback to primary threshold
+                            _n_spike_threshold = _spike_threshold # fallback
 
                         for e in n_events:
                             eid = hashlib.md5(json.dumps(e, sort_keys=True).encode()).hexdigest()
@@ -384,7 +449,7 @@ class Memory:
                     if len(parts) > 1 and '/' in parts[1]:
                         metric_part = parts[1].split('/', 1)[1]
                         import re
-                        t_metric = re.split(r'[><]', metric_part)[0].lower()
+                        t_metric = re.split(r'[><=]', metric_part)[0].lower()
                         if any(kw in t_metric for kw in ['latency', 'delay', 'duration', 'time', 'ms', 'lag']): trigger_category = 'latency'
                         elif any(kw in t_metric for kw in ['error', 'failure', '5xx', '4xx', 'exception', 'status', 'rate']): trigger_category = 'error'
                         elif any(kw in t_metric for kw in ['qps', 'throughput', 'rps', 'requests', 'count']): trigger_category = 'throughput'
@@ -392,6 +457,16 @@ class Memory:
                         
                     deploys = [e for e in events_in_window if e.get("kind") == "deploy"]
                     errors  = [e for e in events_in_window if e.get("kind") == "log" and e.get("level") == "error"]
+                    # Collect all metric values in this window to compute adaptive anomaly threshold.
+                    # Using mean + 2*std so the threshold adapts to any metric scale.
+                    _m_values = [e.get("value", 0) for e in events_in_window if e.get("kind") == "metric"]
+                    if len(_m_values) >= 3:
+                        import statistics as _st
+                        _m_mean = _st.mean(_m_values)
+                        _m_std  = _st.stdev(_m_values)
+                        _spike_threshold = _m_mean + 2 * _m_std if _m_std > 0 else _m_mean * 1.5
+                    else:
+                        _spike_threshold = 0
 
                     _category_keywords = {
                         'latency':    ['latency', 'delay', 'duration', 'time', 'ms', 'lag'],
@@ -426,23 +501,6 @@ class Memory:
                                 "cause_event_id": f"error:{error.get('msg', 'error')[:40]}", "effect_event_id": signal_eid, "evidence": "Error preceded incident declaration", "confidence": _temporal_confidence(error.get("ts"), happened_at, 0.90)})
                     
                     fingerprint      = extract_fingerprint(events_in_window, trigger, happened_at, neighbor_events=neighbor_events)
-                    
-                    # The version that triggered the incident
-                    triggering_version = deploys[-1].get("version", "") if deploys else ""
-
-                    # The version that resolved it (from the remediation, ingested after the signal)
-                    # Query remediations table for this incident_id
-                    rem_row = self.db.execute(
-                        "SELECT version FROM remediations WHERE incident_id = ? LIMIT 1",
-                        (incident_id,)
-                    ).fetchone()
-                    resolved_version = rem_row[0] if rem_row else ""
-                    
-                    fingerprint["triggering_version"] = triggering_version
-                    fingerprint["resolved_version"] = resolved_version
-                    
-                    print(f"[FP] {incident_id} triggering_version={fingerprint.get('triggering_version')} resolved_version={fingerprint.get('resolved_version')}")
-                    
                     fingerprint_json = json.dumps(fingerprint)
                     causal_json = json.dumps(causal_chain)
                     self.db.execute(

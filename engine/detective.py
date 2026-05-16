@@ -177,7 +177,7 @@ def reconstruct(memory, signal, mode="fast") -> dict:
             trigger_category = 'resource'
 
     # Compute adaptive threshold for metric spikes
-    _m_values = [e.get("value", 0) for e in initial_events if e.get("kind") == "metric"]
+    _m_values = [e.get("value", 0) for e in related_events if e.get("kind") == "metric"]
     if len(_m_values) >= 3:
         import statistics as _st
         _m_mean = _st.mean(_m_values)
@@ -254,8 +254,6 @@ def reconstruct(memory, signal, mode="fast") -> dict:
     # Fingerprint current incident using clearly separated primary and neighbor events
     fp_current    = extract_fingerprint(initial_events, trigger, signal.get("ts"),
                                         neighbor_events=neighbor_events)
-    fp_current["triggering_version"] = deploys[-1].get("version", "") if deploys else ""
-    print(f"[FP_EVAL] {signal.get('incident_id')} triggering_version={fp_current.get('triggering_version')}")
     motif_current = extract_motif(causal_chain)
     if hasattr(memory, 'update_incident_record'):
         memory.update_incident_record(incident_id, fp_current, causal_chain)
@@ -283,53 +281,14 @@ def reconstruct(memory, signal, mode="fast") -> dict:
     # Relative threshold: sort by score, then find the natural gap in distribution.
     # This avoids a fixed cutoff that breaks when score distributions shift at L3.
     all_scored.sort(key=lambda x: x[0], reverse=True)
-    
-    # Re-rank: among lineage candidates, prioritize version match
-    eval_deploy_version = fp_current.get("triggering_version", "")
-    if eval_deploy_version:
-        def _rerank_key(item):
-            sim, past = item
-            fp_past = past.get("fingerprint", {})
-            past_version = fp_past.get("triggering_version", "")
-            # Exact version match → boost to top
-            if past_version == eval_deploy_version:
-                return (1, sim)
-            # Same major.minor → second tier
-            def _maj_min(v):
-                p = v.lstrip("vV").split(".")
-                return ".".join(p[:2]) if len(p) >= 2 else v
-            if _maj_min(past_version) == _maj_min(eval_deploy_version):
-                return (0.5, sim)
-            return (0, sim)
-        
-        lineage_scored = [(sim, past) for sim, past in all_scored
-                          if _identity_overlap_score(canonical_id, past.get("canonical_id"), tig) > 0]
-        non_lineage_scored = [(sim, past) for sim, past in all_scored
-                              if _identity_overlap_score(canonical_id, past.get("canonical_id"), tig) == 0]
-        
-        lineage_scored.sort(key=_rerank_key, reverse=True)
-        all_scored = lineage_scored + non_lineage_scored
-
     scored = []
-    
-    # Pass 1: candidates with TIG lineage overlap
-    lineage_candidates = [(sim, past) for sim, past in all_scored 
-                          if _identity_overlap_score(canonical_id, past.get("canonical_id"), tig) > 0]
-
-    # Pass 2: if lineage_candidates has >= 5, use only those
-    # If fewer than 5, fill remaining slots from non-lineage candidates
-    if len(lineage_candidates) >= 5:
-        selection_pool = lineage_candidates
-    else:
-        non_lineage = [(sim, past) for sim, past in all_scored 
-                       if past not in [p for _, p in lineage_candidates]]
-        selection_pool = lineage_candidates + non_lineage
-
-    if selection_pool:
+    if all_scored:
         # Always take the top candidate to handle completely new incident families.
         # We want to return up to 5 candidates.
         # We only stop early if the candidate has zero absolute similarity.
-        for sim, past in selection_pool:
+        # Removing the 0.20 gap threshold to maximize precision@5 recall capacity.
+        prev_sim = all_scored[0][0]
+        for sim, past in all_scored:
             if sim <= 0.0:
                 break
             if len(scored) >= 5:
@@ -346,6 +305,7 @@ def reconstruct(memory, signal, mode="fast") -> dict:
                     f"identity={'same' if id_match else 'related' if id_match is False else 'unknown'}"
                 )
             })
+            prev_sim = sim
 
     # Finalize the top matches list
     similar_past_incidents = scored
@@ -353,15 +313,6 @@ def reconstruct(memory, signal, mode="fast") -> dict:
     # Step 6: remediations
     suggested_remediations = []
     seen_actions = set()
-    
-    trigger_v = fp_current.get("triggering_version", "")
-    import re
-    expected_rb = None
-    if trigger_v:
-        m = re.search(r"(v?\d+\.)(\d+)(\.\d+)", trigger_v)
-        if m:
-            expected_rb = f"{m.group(1)}{int(m.group(2))-1}{m.group(3)}"
-
     for match in similar_past_incidents[:5]:
         rems = memory.get_remediations_for_incident(match.get("incident_id")) if hasattr(memory, 'get_remediations_for_incident') else []
         for action, target_id, version, outcome in rems:
@@ -371,18 +322,12 @@ def reconstruct(memory, signal, mode="fast") -> dict:
             seen_actions.add(action_key)
             current_target = memory.tig.current_name(target_id) if hasattr(memory.tig, 'current_name') else target_id
             conf = round(match.get("similarity", 0) * (1.0 if outcome == "resolved" else 0.4), 3)
-            
             suggested_remediations.append({
                 "action":             action,
                 "target":             current_target,
                 "historical_outcome": outcome,
-                "confidence":         conf,
-                "_version":           version
+                "confidence":         conf
             })
-            
-    suggested_remediations.sort(key=lambda x: (x.get("_version") == expected_rb, x["confidence"]), reverse=True)
-    for r in suggested_remediations:
-        r.pop("_version", None)
 
     # Step 7: overall confidence
     confidence = 0.2
@@ -428,6 +373,8 @@ def reconstruct(memory, signal, mode="fast") -> dict:
         parts.append("[Extended analysis: reviewing full event history for secondary patterns.]")
 
     return {
+        "service":                svc_name,
+        "root_cause_id":          causal_chain[0].get("cause_event_id") if causal_chain else None,
         "related_events":         related_events,
         "causal_chain":           causal_chain,
         "similar_past_incidents": similar_past_incidents,

@@ -16,7 +16,6 @@ _FEATURE_WEIGHTS = {
     "neighbor_spike_count": 0.35, # correlated blast radius — multi-service signal
     "neighbor_error_count": 0.30, # error contagion across services
     "neighbor_canonical_sig": 0.50, # blast-radius identity: WHICH services were affected
-    "deploy_version_prefix": 0.35, # coverage-independent family signal
 }
 _TOTAL_WEIGHT = sum(_FEATURE_WEIGHTS.values())
 
@@ -132,34 +131,29 @@ def extract_fingerprint(events, trigger, end_ts, neighbor_events=None):
         nm_mean = _stats.mean(neighbor_metric_values)
         nm_std  = _stats.stdev(neighbor_metric_values)
         neighbor_spike_threshold = nm_mean + 2 * nm_std if nm_std > 0 else nm_mean * 1.5
-    elif neighbor_metric_values:
-        # Single-service fallback: use median as a reasonable threshold
-        neighbor_spike_threshold = sorted(neighbor_metric_values)[len(neighbor_metric_values) // 2]
+    elif metric_values:
+        neighbor_spike_threshold = spike_threshold  # fall back to primary window threshold
     else:
-        neighbor_spike_threshold = float('inf')  # no metrics → no spikes
+        neighbor_spike_threshold = 0
 
     if neighbor_events:
         for e in neighbor_events:
             ne_kind = e.get("kind", "")
-            # For non-trace events use service field; for traces use first span's svc
-            if ne_kind == "trace":
-                spans = e.get("spans", [])
-                for span in spans:
-                    span_svc = span.get("svc")
-                    if span_svc:
-                        neighbor_canonical_sig.add(f"trace:{span_svc}")
-                continue
+            cid = e.get("canonical_id") or e.get("service")
+            if not cid: continue
             
-            cid = e.get("service")
-            if not cid:
-                continue
-                
             if ne_kind == "metric" and e.get("value", 0) > neighbor_spike_threshold:
                 neighbor_spike_count += 1
-                neighbor_canonical_sig.add(f"{cid}:metric:{e.get('name', 'metric')}")
+                m_name = e.get("name", "metric")
+                neighbor_canonical_sig.add(f"{cid}:metric:{m_name}")
             elif ne_kind == "log" and e.get("level") == "error":
                 neighbor_error_count += 1
                 neighbor_canonical_sig.add(f"{cid}:log:error")
+            elif ne_kind == "trace":
+                for span in e.get("spans", []):
+                    span_svc = span.get("svc")
+                    if span_svc:
+                        neighbor_canonical_sig.add(f"{cid}:trace:{span_svc}")
 
     # Bucket neighbor signals structurally (not raw integers)
     def _bucket(n):
@@ -195,18 +189,6 @@ def extract_fingerprint(events, trigger, end_ts, neighbor_events=None):
         except ValueError:
             pass
 
-    # Capture the version of the deploy that immediately preceded the incident
-    deploy_version_prefix = ""
-    if had_deploy and last_deploy_ts_str:
-        for e in events:
-            if e.get("kind") == "deploy" and (e.get("ts") or e.get("happened_at")) == last_deploy_ts_str:
-                raw_version = e.get("version", "")
-                # Extract major version prefix only: "v2.14.3" → "v2", "1.0.0" → "1"
-                # This groups incidents by major version family, not exact version
-                stripped = raw_version.lstrip("v").lstrip("V")
-                deploy_version_prefix = "v" + stripped.split(".")[0] if stripped else ""
-                break
-
     return {
         "trigger_type":         trigger_type,
         "trigger_category":     trigger_category,
@@ -219,7 +201,6 @@ def extract_fingerprint(events, trigger, end_ts, neighbor_events=None):
         "neighbor_spike_count": neighbor_spike_bucket,
         "neighbor_error_count": neighbor_error_bucket,
         "neighbor_canonical_sig": sorted(neighbor_canonical_sig),  # blast-radius identity
-        "deploy_version_prefix": deploy_version_prefix,
     }
 
 def combined_similarity(fp1, fp2):
@@ -323,34 +304,6 @@ def combined_similarity(fp1, fp2):
         if union:
             jaccard = len(sig1 & sig2) / len(union)
             earned += w * jaccard
-
-    # --- deploy_version_prefix (coverage-independent family signal) ---
-    dv1 = fp1.get("deploy_version_prefix", "")
-    dv2 = fp2.get("deploy_version_prefix", "")
-    if dv1 and dv2:
-        w = _FEATURE_WEIGHTS["deploy_version_prefix"]
-        budget += w
-        if dv1 == dv2:
-            earned += w
-
-    # --- triggering_version (high weight version family discriminator) ---
-    def _version_family(v):
-        """Extract major.minor as family key: 'v2.14.3' → '2.14'"""
-        stripped = v.lstrip("vV")
-        parts = stripped.split(".")
-        if len(parts) >= 2:
-            return f"{parts[0]}.{parts[1]}"
-        return stripped
-
-    tv1 = fp1.get("triggering_version", "")
-    tv2 = fp2.get("triggering_version", "")
-    if tv1 and tv2:
-        w = 0.50  # high weight — version family is a strong family discriminator
-        budget += w
-        if _version_family(tv1) == _version_family(tv2):
-            earned += w
-        elif tv1.split(".")[0].lstrip("vV") == tv2.split(".")[0].lstrip("vV"):
-            earned += w * 0.5  # same major, different minor — partial credit
 
     # Normalise against actually-present features to avoid penalising sparse data
     score = (earned / budget) if budget > 0 else 0.0
