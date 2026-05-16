@@ -306,12 +306,13 @@ class Memory:
                 elif kind == 'remediation':
                     service_name = event.get('target')
                 
-                # Resolve to canonical_id only for low-volume, high-value events
+                # Resolve to canonical_id via TIG for all event kinds.
+                # tig.lookup is an in-memory dict lookup (<1ms) so running it
+                # on every event is cheaper than branching and missing any row.
                 canonical_id = service_name
-                if kind in ('deploy', 'log', 'incident_signal', 'remediation'):
-                    if hasattr(self, 'tig') and self.tig is not None and service_name:
-                        if hasattr(self.tig, 'lookup'):
-                            canonical_id = self.tig.lookup(service_name, at_time=happened_at)
+                if hasattr(self, 'tig') and self.tig is not None and service_name:
+                    if hasattr(self.tig, 'lookup'):
+                        canonical_id = self.tig.lookup(service_name, at_time=happened_at)
                             
                 events_tuples.append((event_id, happened_at, kind, canonical_id, service_name, raw_json))
                 
@@ -381,10 +382,10 @@ class Memory:
                 trigger     = event.get('trigger', '')
 
                 row = self.db.execute(
-                    "SELECT canonical_id FROM incidents WHERE incident_id = ?",
+                    "SELECT canonical_id, fingerprint_json FROM incidents WHERE incident_id = ?",
                     (incident_id,)
                 ).fetchone()
-                if not row:
+                if not row or row[1] is not None:
                     continue
 
                 canonical_id = row[0]
@@ -418,7 +419,10 @@ class Memory:
                                 connected_svc_names.add(svc)
 
                     neighbor_events = []
-                    seen_eids = {hashlib.md5(json.dumps(e, sort_keys=True).encode()).hexdigest() for e in events_in_window}
+                    # Use event_id (already the primary key in the events table) for
+                    # deduplication — avoids recomputing MD5 hashes over full JSON blobs.
+                    seen_eids = {e.get('event_id') or e.get('id') for e in events_in_window}
+                    seen_eids.discard(None)
                     
                     # Compute adaptive threshold for neighbor windows as well
                     for connected_svc in connected_svc_names:
@@ -438,10 +442,13 @@ class Memory:
                             _n_spike_threshold = _spike_threshold # fallback
 
                         for e in n_events:
-                            eid = hashlib.md5(json.dumps(e, sort_keys=True).encode()).hexdigest()
-                            if eid not in seen_eids:
+                            eid = e.get('event_id') or e.get('id')
+                            if eid and eid not in seen_eids:
                                 neighbor_events.append(e)
                                 seen_eids.add(eid)
+                            elif not eid:
+                                # Fallback: event has no id field, include conservatively
+                                neighbor_events.append(e)
                         
                     # Causal Chain extraction for motifs
                     trigger_category = "unknown"
